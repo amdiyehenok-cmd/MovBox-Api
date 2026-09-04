@@ -155,12 +155,14 @@ setInterval(() => {
 // The app then shows a rewarded ad and calls POST /reward, which
 // resets the counter and mints a fresh upstream token in one shot.
 //
-// Tunable via env: FREE_PLAYS_PER_DAY (default 2 while we're in
-// dev/demo so the cap path is reachable in a couple of plays — flip
-// to 50 for production). Set to a huge number to effectively
-// disable; set lower to push users toward ads faster.
+// Tunable via env: FREE_PLAYS_PER_DAY (default 999 = effectively
+// disabled). The cap exists to force users to watch a rewarded ad
+// every N plays. While Start.io's ad inventory is still ramping
+// up for this app, we set the default to 999 so the cap never
+// blocks the user. Once Start.io has real inventory and we want
+// to push monetization, set this to 50 in the env.
 
-const FREE_PLAYS_PER_DAY = Number(process.env.FREE_PLAYS_PER_DAY || 2);
+const FREE_PLAYS_PER_DAY = Number(process.env.FREE_PLAYS_PER_DAY || 999);
 const REWARD_COOLDOWN_MS = 60 * 1000;   // 1 reward per IP per minute max
 const ipPlays = new Map();   // ip → { count, dayStart }
 const ipLastReward = new Map();  // ip → timestamp
