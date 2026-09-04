@@ -193,8 +193,15 @@ async function handleStream(req,res,p){
     return {...s,url:`${base}/mp4?url=${encodeURIComponent(s.url)}`};
   });
   const out={ok:true,source:'movbox-stream',code:play?.code??0,message:play?.message??'ok',data:{streams:proxiedStreams,freeNum:data.freeNum??0,limited:!!data.limited,hasResource:streams.length>0,vipLocked:!!data.vipLocked,codecPriority:data.codecPriority||[],captions}};
-  cacheSet(k, out, CACHE_TTL.stream);
-  res.writeHead(200,{'content-type':'application/json','x-cache':'miss'});
+  // Only cache "happy" responses. If the upstream returned an empty
+  // stream list (free daily quota burned, VIP-locked content, or a
+  // missing subject), don't pin that to disk for 30 min — the user
+  // would get a stale "no streams" until the cache expires, even after
+  // the upstream limit resets. The next call re-checks the upstream
+  // for free.
+  const worthCaching = streams.length > 0 && !out.data.limited && !out.data.vipLocked;
+  if (worthCaching) cacheSet(k, out, CACHE_TTL.stream);
+  res.writeHead(200,{'content-type':'application/json','x-cache': worthCaching ? 'miss' : 'bypass'});
   res.end(JSON.stringify(out));
 }
 
