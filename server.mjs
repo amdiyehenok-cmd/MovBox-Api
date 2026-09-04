@@ -41,6 +41,13 @@ const CACHE_TTL = {
   subtitle: 60 * 60 * 1000,   // 1 hr — srt/vtt bytes (immutable)
 };
 const cache = new Map();   // key → { ts, ttl, data }
+// Compose the cache key for a /stream call from the parts that uniquely
+// identify a play: detailPath + subjectId + season + episode. We use the
+// same shape as the old single-TTL cache so existing entries don't get
+// duplicated after a redeploy.
+function keyOf(p) {
+  return [p.detailPath, p.subjectId, p.season || 0, p.episode || 0].join('|');
+}
 function cacheGet(k) {
   const e = cache.get(k);
   if (!e) return null;
