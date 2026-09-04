@@ -498,12 +498,15 @@ async function handleSearch(req, res) {
     return;
   }
 
+  // /search uses a per-IP token too, even though it's the relay's job
+  // to mint one. Without Bearer, h5-api returns 400.
+  const token = await getOrMintForIp(clientIp(req));
   // The upstream search endpoint takes a JSON body with these exact
   // field names. We pass through the user's keyword + pagination +
   // subjectType filter unchanged.
   const upstream = await fetch(`${H5}/subject/search`, {
     method: 'POST',
-    headers: upstreamHeaders({ 'Content-Type': 'application/json' }),
+    headers: upstreamHeaders(token, { 'Content-Type': 'application/json' }),
     body: JSON.stringify({ keyword, page, perPage, subjectType }),
   });
   if (!upstream.ok) {
