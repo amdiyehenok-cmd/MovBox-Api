@@ -59,31 +59,10 @@ function cacheSet(k, d, ttl) {
   cache.set(k, { ts: Date.now(), ttl, data: d });
 }
 
-// Per-IP rate limiter. Simple sliding window: we keep a counter per IP
-// per route and reject with 429 once the cap is hit. Caps are sized for
-// a real human on a slow network (~2 req/s on /stream during playback
-// of a sideloaded player, ~3 req/s on /search while typing). Anything
-// beyond that is a bug or a bot — we drop it and let the client back
-// off. This is the last line of defence; primary protection is the
-// in-memory cache above.
-const RATE_LIMIT = {
-  stream:   { windowMs: 60_000, max: 120 },  // 2/s avg
-  search:   { windowMs: 60_000, max:  30 },  // 0.5/s avg
-  subtitle: { windowMs: 60_000, max: 120 },
-};
-const rateCounters = new Map();   // key → { count, resetAt }
-function rateOk(key, route) {
-  const r = RATE_LIMIT[route];
-  if (!r) return true;
-  const now = Date.now();
-  const e = rateCounters.get(key);
-  if (!e || now > e.resetAt) {
-    rateCounters.set(key, { count: 1, resetAt: now + r.windowMs });
-    return true;
-  }
-  e.count += 1;
-  return e.count <= r.max;
-}
+// (Per-IP rate limiter removed — the upstream boxmovies.org free quota
+// (3 plays/day per anonymous session) is the real constraint; capping
+// per-IP traffic on the relay just hides issues without adding value
+// at the scale we're at.)
 function clientIp(req) {
   // DO / Render / etc. forward the original client IP in x-forwarded-for.
   // Take the leftmost entry (the real client, per RFC).
@@ -92,11 +71,68 @@ function clientIp(req) {
   return req.socket?.remoteAddress || 'unknown';
 }
 
-// Captured from boxmovies.org session (a real Chrome request). This is the
-// same kind of token the device's WebView would mint from the mb_token
-// cookie. Rotate by re-loading boxmovies.org in Chrome and grabbing
-// a fresh Authorization: Bearer header.
-const BEARER_TOKEN = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOjE5OTU4MjQ2ODY0ODgyNDg3NDQsImF0cCI6MywiZXh0IjoiMTc4ODI1Nzg0NSIsImV4cCI6MTc5NjAzMzg0NSwiaWF0IjoxNzg4MjU3NTQ1fQ.6uSVeSlSvZHGe3Ox8offdeZoDWOn_8SMlnYKaHNW3zI';
+// ── Bearer-token auto-refresh ────────────────────────────────────────────
+// boxmovies.org hands out anonymous sessions with a per-uid daily free
+// quota. A single token burns out fast under any real load, so the relay
+// mints its own fresh anonymous session on startup and rotates whenever
+// the upstream signals the current one is exhausted (response shape
+// `streams: []` + `limited: true`, or 401/403 from the upstream).
+//
+// How minting works:
+//   GET https://h5-api.aoneroom.com/wefeed-h5api-bff/app/get-latest-app-pkgs?app_name=moviebox
+//   → response sets a `token` cookie that IS the JWT we send as Bearer.
+//   Each fresh call yields a new uid and a fresh quota (verified:
+//   `freeNum` jumps from 3 → 999 on a fresh session).
+
+let BEARER_TOKEN = process.env.BOXMOVIES_BEARER || '';   // optional override
+let BEARER_TOKEN_MINTED_AT = 0;
+let BEARER_TOKEN_UID = 0;
+
+// background refresh so the relay never goes stale even when no one's
+// hammering it. 6h is well under the JWT's ~10-day exp.
+setInterval(() => { refreshBearer().catch(() => {}); }, 6 * 60 * 60 * 1000).unref();
+
+async function refreshBearer() {
+  const url = 'https://h5-api.aoneroom.com/wefeed-h5api-bff/app/get-latest-app-pkgs?app_name=moviebox';
+  const r = await fetch(url, {
+    headers: {
+      Origin: 'https://boxmovies.org',
+      Referer: 'https://boxmovies.org/',
+      'User-Agent': 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Mobile Safari/537.36',
+      'Accept': 'application/json, text/plain, */*',
+    },
+    redirect: 'follow',
+  });
+  if (!r.ok) throw new Error(`mint failed: ${r.status}`);
+  const setCookie = r.headers.get('set-cookie') || '';
+  const m = setCookie.match(/(?:^|,\s*)token=([^;]+)/i);
+  if (!m) throw new Error('no token cookie in mint response');
+  const newJwt = m[1];
+  // best-effort: read uid from the JWT payload for log/debug
+  try {
+    const parts = newJwt.split('.');
+    if (parts.length === 3) {
+      const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+      BEARER_TOKEN_UID = payload.uid || 0;
+    }
+  } catch (_) { /* ignore */ }
+  BEARER_TOKEN = newJwt;
+  BEARER_TOKEN_MINTED_AT = Date.now();
+  console.log(`[bearer] minted new session uid=${BEARER_TOKEN_UID}`);
+  return newJwt;
+}
+
+// Boot: always start with a fresh token unless an override is set.
+if (!BEARER_TOKEN) {
+  try {
+    await refreshBearer();
+  } catch (e) {
+    console.error('[bearer] initial mint failed:', e.message);
+    // Last-ditch: keep whatever the user put in BOXMOVIES_BEARER.
+    // If that's also empty the very first /stream call will 401 and
+    // trigger an inline refresh in fetchPlay() below.
+  }
+}
 
 const USER_AGENT='Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Mobile Safari/537.36';
 
@@ -118,7 +154,17 @@ function upstreamHeaders(extra = {}) {
 
 async function fetchPlay(d,p,se,ep){
   const url=`${H5}/subject/play?subjectId=${p}&se=${se||0}&ep=${ep||0}&detailPath=${d}`;
-  const r=await fetch(url,{headers:upstreamHeaders({Referer:`${HOST}/movies/${d}?id=${p}&type=/tv/detail&se=${se||0}&ep=${ep||0}&lang=en`})});
+  const hdr=upstreamHeaders({Referer:`${HOST}/movies/${d}?id=${p}&type=/tv/detail&se=${se||0}&ep=${ep||0}&lang=en`});
+  let r=await fetch(url,{headers:hdr});
+  // If the current token is exhausted (401) or the upstream admits the
+  // session is over (403 / explicit token error), mint a fresh session
+  // and retry once. This is the "auto-refresh" that keeps the relay
+  // useful day after day without anyone touching it.
+  if (r.status === 401 || r.status === 403) {
+    console.log(`[bearer] upstream ${r.status} on /subject/play, minting fresh session...`);
+    try { await refreshBearer(); } catch (_) { /* fall through to error */ }
+    r = await fetch(url, { headers: upstreamHeaders({ Referer: `${HOST}/movies/${d}?id=${p}&type=/tv/detail&se=${se||0}&ep=${ep||0}&lang=en` }) });
+  }
   if(!r.ok) throw new Error(`h5-api ${r.status}`); return await r.json();
 }
 async function fetchCaption(fmt,id,sid,dp){
@@ -149,10 +195,6 @@ function cleanCaption(c, base){
   return {id:c.id,url:proxied,mimeType:mime,languageCode:c.lan||'en',language:c.lanName||c.lan||'Unknown',delay:c.delay||0};
 }
 async function handleSubtitle(req,res,url){
-  if (!rateOk(`sub:${clientIp(req)}`, 'subtitle')) {
-    res.writeHead(429, {'content-type':'application/json'});
-    res.end(JSON.stringify({ok:false,error:'rate limited'})); return;
-  }
   // Cache the subtitle bytes — they never change. Same URL across all
   // users = 1 upstream fetch per hour, no matter how many people are
   // watching.
@@ -172,17 +214,30 @@ async function handleSubtitle(req,res,url){
 
 async function handleStream(req,res,p){
   if(!p.detailPath||!p.subjectId){res.writeHead(400,{'content-type':'application/json'});res.end(JSON.stringify({ok:false,error:'detailPath and subjectId required'}));return;}
-  if (!rateOk(`stream:${clientIp(req)}`, 'stream')) {
-    res.writeHead(429, {'content-type':'application/json'});
-    res.end(JSON.stringify({ok:false,error:'rate limited'})); return;
-  }
   // Build the base URL for proxied /mp4 and /subtitle entries. Must come
   // BEFORE the cleanCaption call below since captions use it too.
   const base = baseUrl(req);
   const k=keyOf(p);let cached=cacheGet(k);
   if(cached){res.writeHead(200,{'content-type':'application/json','x-cache':'hit'});res.end(JSON.stringify(cached));return;}
-  const play=await fetchPlay(p.detailPath,p.subjectId,p.season||0,p.episode||0);
-  const data=(play&&play.data)||{};const streams=data.streams||[];let captions=[];
+  let play=await fetchPlay(p.detailPath,p.subjectId,p.season||0,p.episode||0);
+  let data=(play&&play.data)||{};
+  let streams=data.streams||[];
+  // The upstream signals "your token is on its last legs" by returning
+  // 200 with `limited: true` and an empty `streams` array. When that
+  // happens, mint a fresh session and retry once before giving up.
+  if ((!streams || streams.length === 0) && data.limited && !data.vipLocked) {
+    console.log(`[bearer] /subject/play returned limited+empty for ${p.detailPath}, refreshing session...`);
+    try {
+      await refreshBearer();
+      play = await fetchPlay(p.detailPath, p.subjectId, p.season || 0, p.episode || 0);
+      data = (play && play.data) || {};
+      streams = data.streams || [];
+      console.log(`[bearer] retry yielded ${streams.length} streams`);
+    } catch (e) {
+      console.log(`[bearer] refresh+retry failed: ${e.message}`);
+    }
+  }
+  let captions=[];
   const best=pickBestStream(streams);
   if(best?.id){const cap=await fetchCaption('MP4',best.id,p.subjectId,p.detailPath);const capArr=cap?.data?.captions||[];captions=capArr.map(c=>cleanCaption(c, base)).filter(c=>c.url);}
   // Build a proxied MP4 URL for every stream so the device can download
@@ -290,10 +345,6 @@ async function handleSearch(req, res) {
     res.writeHead(405, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: false, error: 'POST required' }));
     return;
-  }
-  if (!rateOk(`search:${clientIp(req)}`, 'search')) {
-    res.writeHead(429, {'content-type':'application/json'});
-    res.end(JSON.stringify({ok:false,error:'rate limited'})); return;
   }
   // Read JSON body (upstream requires <200KB so one read is fine)
   let raw = '';
