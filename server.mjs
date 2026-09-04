@@ -176,6 +176,9 @@ async function handleStream(req,res,p){
     res.writeHead(429, {'content-type':'application/json'});
     res.end(JSON.stringify({ok:false,error:'rate limited'})); return;
   }
+  // Build the base URL for proxied /mp4 and /subtitle entries. Must come
+  // BEFORE the cleanCaption call below since captions use it too.
+  const base = baseUrl(req);
   const k=keyOf(p);let cached=cacheGet(k);
   if(cached){res.writeHead(200,{'content-type':'application/json','x-cache':'hit'});res.end(JSON.stringify(cached));return;}
   const play=await fetchPlay(p.detailPath,p.subjectId,p.season||0,p.episode||0);
@@ -185,7 +188,6 @@ async function handleStream(req,res,p){
   // Build a proxied MP4 URL for every stream so the device can download
   // it via the relay. Without this, the device tries to hit the upstream
   // CDN directly and gets rate-limited.
-  const base = baseUrl(req);
   const proxiedStreams=streams.map(s=>{
     if(!s.url) return s;
     return {...s,url:`${base}/mp4?url=${encodeURIComponent(s.url)}`};
