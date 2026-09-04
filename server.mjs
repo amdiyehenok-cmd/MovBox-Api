@@ -127,8 +127,22 @@ async function fetchCaption(fmt,id,sid,dp){
   if(!r.ok) return null; try{return await r.json();}catch{return null;}
 }
 function pickBestStream(s){let b=null;for(const x of s||[]){if(!x?.url||!x?.id)continue;const r=Number(x.resolutions)||x.resolution||0;if(!b||r>(b._res||0))b={...x,_res:r};}return b;}
-function cleanCaption(c,hostHeader){
-  const base=PUBLIC_HOST||`http://${hostHeader}`;
+
+// Build the absolute base URL the device will use to call back into the
+// relay for /mp4 and /subtitle. PUBLIC_HOST is preferred (set it in
+// production to your real public URL, e.g. https://movbox-api.onrender.com)
+// so device-facing URLs are stable even behind a proxy that rewrites the
+// host header. When PUBLIC_HOST is empty, fall back to the protocol
+// DO/Render/etc. forward in `x-forwarded-proto` and the Host header.
+// This matters: if we hardcoded http:// but the platform only serves
+// https://, every /mp4 and /subtitle request would 301 to https and
+// ExoPlayer would throw "Source error" before even reaching the stream.
+function baseUrl(req) {
+  if (PUBLIC_HOST) return PUBLIC_HOST.replace(/\/+$/, '');
+  const proto = (req.headers['x-forwarded-proto'] || 'https').toString();
+  return `${proto}://${req.headers.host}`;
+}
+function cleanCaption(c, base){
   const proxied=c.url?`${base}/subtitle?url=${encodeURIComponent(c.url)}`:c.url;
   const ext=c.url?c.url.split('?')[0].split('.').pop()?.toLowerCase():'';
   const mime=ext==='vtt'?'text/vtt':ext==='srt'?'application/x-subrip':'application/x-subrip';
@@ -167,11 +181,11 @@ async function handleStream(req,res,p){
   const play=await fetchPlay(p.detailPath,p.subjectId,p.season||0,p.episode||0);
   const data=(play&&play.data)||{};const streams=data.streams||[];let captions=[];
   const best=pickBestStream(streams);
-  if(best?.id){const cap=await fetchCaption('MP4',best.id,p.subjectId,p.detailPath);const capArr=cap?.data?.captions||[];captions=capArr.map(c=>cleanCaption(c,req.headers.host)).filter(c=>c.url);}
+  if(best?.id){const cap=await fetchCaption('MP4',best.id,p.subjectId,p.detailPath);const capArr=cap?.data?.captions||[];captions=capArr.map(c=>cleanCaption(c, base)).filter(c=>c.url);}
   // Build a proxied MP4 URL for every stream so the device can download
   // it via the relay. Without this, the device tries to hit the upstream
   // CDN directly and gets rate-limited.
-  const base=PUBLIC_HOST||`http://${req.headers.host}`;
+  const base = baseUrl(req);
   const proxiedStreams=streams.map(s=>{
     if(!s.url) return s;
     return {...s,url:`${base}/mp4?url=${encodeURIComponent(s.url)}`};
