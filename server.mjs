@@ -155,10 +155,12 @@ setInterval(() => {
 // The app then shows a rewarded ad and calls POST /reward, which
 // resets the counter and mints a fresh upstream token in one shot.
 //
-// Tunable via env: FREE_PLAYS_PER_DAY (default 50). Set to a huge number
-// to effectively disable; set lower to push users toward ads faster.
+// Tunable via env: FREE_PLAYS_PER_DAY (default 2 while we're in
+// dev/demo so the cap path is reachable in a couple of plays — flip
+// to 50 for production). Set to a huge number to effectively
+// disable; set lower to push users toward ads faster.
 
-const FREE_PLAYS_PER_DAY = Number(process.env.FREE_PLAYS_PER_DAY || 50);
+const FREE_PLAYS_PER_DAY = Number(process.env.FREE_PLAYS_PER_DAY || 2);
 const REWARD_COOLDOWN_MS = 60 * 1000;   // 1 reward per IP per minute max
 const ipPlays = new Map();   // ip → { count, dayStart }
 const ipLastReward = new Map();  // ip → timestamp
