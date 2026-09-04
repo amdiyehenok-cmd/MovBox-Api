@@ -1,0 +1,16 @@
+{
+  "name": "movbox-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Thin relay for MovBox Android app. Proxies boxmovies.org h5-api stream/search/subtitle endpoints and serves MP4 bytes with the right upstream headers so the device can download.",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node --watch server.mjs"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "UNLICENSED"
+}

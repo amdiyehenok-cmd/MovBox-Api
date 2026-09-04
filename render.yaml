@@ -1,0 +1,27 @@
+# Render Blueprint (Infrastructure-as-Code).
+# Apply via: https://dashboard.render.com/blueprints — connect this repo
+# and Render provisions + deploys the service on every push to main.
+
+services:
+  - type: web
+    name: movbox-api
+    runtime: docker
+    plan: free
+    region: oregon
+    branch: main
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOSTNAME
+        value: 0.0.0.0
+      - key: PORT
+        value: 4000
+      # PUBLIC_HOST is filled in automatically by Render once the service
+      # is live (e.g. https://movbox-api.onrender.com). The relay uses
+      # it to build absolute /mp4 and /subtitle URLs in the /stream
+      # response so the device can resolve them.
+      - key: PUBLIC_HOST
+        sync: false
