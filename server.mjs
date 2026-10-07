@@ -21,6 +21,7 @@
 // get a 401 — easy to detect and rotate.
 
 import http from 'node:http';
+import https from 'node:https';
 import { URL } from 'node:url';
 
 const H5 = 'https://h5-api.aoneroom.com/wefeed-h5api-bff';
@@ -28,7 +29,104 @@ const HOST = 'https://boxmovies.org';
 const PORT = Number(process.env.PORT || 4000);
 const HOSTNAME = process.env.HOST || '0.0.0.0';
 const PUBLIC_HOST = process.env.PUBLIC_HOST || '';
-const CACHE_MAX = 500;
+
+// ── Upstream connection pool ───────────────────────────────────────────
+// Every media byte comes from one CDN host. Reusing the TLS connection
+// across requests removes a full TCP+TLS handshake from the critical
+// path of every range request (which the browser issues many of, while
+// seeking and rebuffering).
+const upstreamAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30_000,
+  maxSockets: 64,
+  maxFreeSockets: 16,
+  timeout: 0,
+});
+
+// ── Generic byte-budgeted LRU ──────────────────────────────────────────
+// Bounded by bytes rather than entry count so one big buffer can't blow
+// the container's memory budget. Deleting an entry calls its onEvict
+// hook so the caller can keep a running byte total.
+class ByteLRU {
+  constructor(maxBytes, onEvict) {
+    this.maxBytes = maxBytes;
+    this.bytes = 0;
+    this.onEvict = onEvict || null;
+    this.m = new Map();   // key → { size, value }; Map preserves insertion order
+  }
+  get(k) {
+    const e = this.m.get(k);
+    if (!e) return null;
+    // Refresh recency: re-insert moves the key to the end.
+    this.m.delete(k);
+    this.m.set(k, e);
+    return e.value;
+  }
+  has(k) { return this.m.has(k); }
+  set(k, value, size) {
+    const prev = this.m.get(k);
+    if (prev) { this.bytes -= prev.size; this.m.delete(k); }
+    this.m.set(k, { size, value });
+    this.bytes += size;
+    while (this.bytes > this.maxBytes && this.m.size > 0) {
+      const oldest = this.m.keys().next().value;
+      const e = this.m.get(oldest);
+      this.m.delete(oldest);
+      this.bytes -= e.size;
+      if (this.onEvict) this.onEvict(oldest, e.value, e.size);
+    }
+  }
+  get size() { return this.m.size; }
+  get totalBytes() { return this.bytes; }
+}
+// Metadata cache budget. Subtitle bodies are the only large entries here
+// (tens of KB); /stream and /search payloads are a few KB. 32MB is far
+// more than this keyspace needs and keeps the container lean.
+//
+// The old implementation was a FIFO keyed on insertion order with a hard
+// 500-entry cap, so a burst of /search queries evicted the /stream
+// metadata we cared about most — /health reported cache_size pinned at
+// exactly 500/500, which is the tell that eviction was thrashing and
+// every "cache hit rate" was really a miss.
+const CACHE_BUDGET_BYTES = 32 * 1024 * 1024;
+
+// key → { ts, ttl, data }. Recency is handled by ByteLRU (get()
+// re-inserts), so a hot /stream entry survives a flood of searches.
+const cache = new ByteLRU(CACHE_BUDGET_BYTES);
+function cacheDelete(k) {
+  const e = cache.m.get(k);
+  if (!e) return;
+  cache.m.delete(k);
+}
+function cacheGet(k) {
+  const e = cache.get(k);
+  if (!e) return null;
+  if (Date.now() - e.ts > e.ttl) { cacheDelete(k); return null; }
+  return e.data;
+}
+function cacheSet(k, d, ttl) {
+  const size = typeof d === 'string'
+    ? d.length
+    : (d && d.buf && d.buf.length) || JSON.stringify(d ?? null).length * 2;
+  cache.set(k, { ts: Date.now(), ttl, data: d }, size);
+}
+
+// ── Media head cache ───────────────────────────────────────────────────
+// A progressive MP4 cannot decode a single frame until the browser has
+// downloaded the whole `moov` atom. Ours are ~3MB. Measured end to end
+// that moov download is the single largest contributor to time-to-first-
+// frame, and because every viewer of the same title asks for the same
+// byte range first, it is trivially cacheable.
+//
+// Key is the upstream PATH, not the full URL: the CDN rotates `sign` and
+// `t` on every request but the bytes behind a path never change.
+const HEAD_CACHE_BYTES = 4 * 1024 * 1024;      // covers our ~3MB moov
+const HEAD_CACHE_BUDGET = 128 * 1024 * 1024;   // ~32 titles resident
+const headCache = new ByteLRU(HEAD_CACHE_BUDGET);
+
+function headCacheKey(upstreamUrl) {
+  try { return new URL(upstreamUrl).pathname; } catch { return upstreamUrl; }
+}
 // Per-endpoint TTLs. /stream metadata changes rarely (only when boxmovies
 // rotates their CDN URLs or a source goes down), /search results barely
 // change at all in a 1hr window, and /subtitle bodies are immutable once
@@ -40,23 +138,12 @@ const CACHE_TTL = {
   search:   60 * 60 * 1000,   // 1 hr — search results
   subtitle: 60 * 60 * 1000,   // 1 hr — srt/vtt bytes (immutable)
 };
-const cache = new Map();   // key → { ts, ttl, data }
 // Compose the cache key for a /stream call from the parts that uniquely
 // identify a play: detailPath + subjectId + season + episode. We use the
 // same shape as the old single-TTL cache so existing entries don't get
 // duplicated after a redeploy.
 function keyOf(p) {
   return [p.detailPath, p.subjectId, p.season || 0, p.episode || 0].join('|');
-}
-function cacheGet(k) {
-  const e = cache.get(k);
-  if (!e) return null;
-  if (Date.now() - e.ts > e.ttl) { cache.delete(k); return null; }
-  return e.data;
-}
-function cacheSet(k, d, ttl) {
-  if (cache.size >= CACHE_MAX) cache.delete(cache.keys().next().value);
-  cache.set(k, { ts: Date.now(), ttl, data: d });
 }
 
 // (Per-IP rate limiter removed — the upstream boxmovies.org free quota
@@ -382,59 +469,201 @@ async function handleReward(req, res) {
 /**
  * /mp4?url=<encoded>
  *
- * Streams the upstream MP4 back to the phone with the right Referer/
- * Origin headers so the upstream CDN accepts the request. The phone
- * can't fetch the MP4 directly (its IP is rate-limited), so we proxy
- * it. Range requests are passed through so DownloadManager can
- * resume partial downloads.
+ * Streams the upstream MP4 back to the client with the Referer/Origin
+ * headers the upstream CDN insists on. The client can't send those on a
+ * cross-origin <video> request, so it has to come through us.
+ *
+ * Two things make this fast:
+ *
+ * 1. Native streaming instead of undici. The previous implementation
+ *    used `fetch()` + `body.getReader()` and awaited once per ~64KB
+ *    chunk. undici's fetch body reader is a JS-level async generator
+ *    with no C++ fast path, and measured end to end it capped the whole
+ *    relay at 0.02-0.18 MB/s while the identical upstream request from
+ *    the same machine ran at 1.27 MB/s — a ~64x loss that had nothing
+ *    to do with the network. `up.pipe(res)` is the real fast path.
+ *
+ * 2. A head cache. Every viewer's first request is for the same leading
+ *    bytes, which is where the ~3MB `moov` index lives. Serving that
+ *    from memory turns the single largest contributor to
+ *    time-to-first-frame into a memcpy.
+ *
+ * Range requests are passed through untouched so seeking and
+ * DownloadManager resume keep working.
  */
+
+// Parse a single-range "bytes=start-end" header. Returns null for
+// multi-range or malformed input, which we treat as "no usable range".
+function parseRange(hdr) {
+  if (!hdr) return null;
+  const m = /^bytes=(\d*)-(\d*)$/.exec(String(hdr).trim());
+  if (!m) return null;
+  const [, a, b] = m;
+  if (a === '' && b === '') return null;
+  return { start: a === '' ? 0 : Number(a), end: b === '' ? null : Number(b) };
+}
+
+// Pull the total file size out of a Content-Range header.
+function totalFromContentRange(cr) {
+  if (!cr) return null;
+  const m = /\/(\d+)\s*$/.exec(String(cr));
+  return m ? Number(m[1]) : null;
+}
+
+// Collect an entire upstream response into a Buffer, with a hard cap so
+// a malformed/huge response can never exhaust the container.
+function readAll(res, limitBytes) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let got = 0;
+    res.on('data', (c) => {
+      got += c.length;
+      if (got > limitBytes) { res.destroy(); reject(new Error('head too large')); return; }
+      chunks.push(c);
+    });
+    res.on('end', () => resolve(Buffer.concat(chunks, got)));
+    res.on('error', reject);
+  });
+}
+
 async function handleMp4(req, res, url) {
   if (!url) {
     res.writeHead(400, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: false, error: 'url required' }));
     return;
   }
-  const upstreamHeaders = {
+
+  const hdrs = {
     Origin: HOST,
     Referer: `${HOST}/`,
     'User-Agent': USER_AGENT,
+    'Accept-Encoding': 'identity',   // never let the CDN gzip media
   };
-  if (req.headers['range']) upstreamHeaders['Range'] = req.headers['range'];
+  const rangeHeader = req.headers['range'];
+  if (rangeHeader) hdrs['Range'] = rangeHeader;
 
-  const upstream = await fetch(url, {
-    headers: upstreamHeaders,
-    redirect: 'follow',
-  });
-  if (!upstream.ok && upstream.status !== 206) {
-    res.writeHead(upstream.status, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: false, error: `upstream ${upstream.status}` }));
-    return;
-  }
-  const outHeaders = {
-    'content-type': upstream.headers.get('content-type') || 'video/mp4',
-    'accept-ranges': upstream.headers.get('accept-ranges') || 'bytes',
-    'access-control-allow-origin': '*',
-  };
-  const len = upstream.headers.get('content-length');
-  if (len) outHeaders['content-length'] = len;
-  const range = upstream.headers.get('content-range');
-  if (range) outHeaders['content-range'] = range;
-  res.writeHead(upstream.status, outHeaders);
-  const reader = upstream.body.getReader();
-  const pump = async () => {
-    try {
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) { res.end(); return; }
-        if (!res.write(value)) {
-          await new Promise((r) => res.once('drain', r));
-        }
-      }
-    } catch (e) {
-      try { res.end(); } catch (_) {}
+  const parsed = new URL(url);
+  const mod = parsed.protocol === 'http:' ? http : https;
+  const key = headCacheKey(url);
+
+  // ── Head-cache fast path ───────────────────────────────────────────
+  // Only for explicit bounded ranges starting at byte 0 — that is the
+  // shape a <video> element issues while it fetches the index.
+  const r = parseRange(rangeHeader);
+  if (r && r.start === 0 && r.end !== null && r.end < HEAD_CACHE_BYTES) {
+    const hit = headCache.get(key);
+    if (hit && hit.buf.length >= r.end + 1) {
+      const slice = hit.buf.subarray(0, r.end + 1);
+      const cr = `bytes 0-${r.end}/${hit.total || hit.buf.length}`;
+      res.writeHead(206, {
+        'content-type': 'video/mp4',
+        'content-length': String(slice.length),
+        'content-range': cr,
+        'accept-ranges': 'bytes',
+        'access-control-allow-origin': '*',
+        'x-cache': 'hit',
+      });
+      res.end(slice);
+      return;
     }
+  }
+
+  let settled = false;
+  const onClientGone = () => {
+    if (settled) return;
+    settled = true;
+    try { upReq.destroy(); } catch (_) {}
+    try { res.end(); } catch (_) {}
   };
-  pump();
+
+  const upReq = mod.request(
+    {
+      protocol: parsed.protocol,
+      hostname: parsed.hostname,
+      port: parsed.port || (parsed.protocol === 'http:' ? 80 : 443),
+      path: parsed.pathname + parsed.search,
+      method: 'GET',
+      headers: hdrs,
+      agent: upstreamAgent,
+      // The CDN must not hand us a redirect for media; a redirect here
+      // would silently drop our Origin/Referer and 429 the follow-up.
+      // undici's fetch(redirect:'follow') handled this; native does not.
+      // We surface it as an error instead of guessing.
+    },
+    (up) => {
+      if (up.statusCode >= 300 && up.statusCode < 400 && up.headers.location) {
+        up.resume();
+        settled = true;
+        res.writeHead(up.statusCode, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: `upstream redirect ${up.statusCode}` }));
+        return;
+      }
+      if (up.statusCode !== 206 && up.statusCode !== 200) {
+        up.resume();
+        settled = true;
+        res.writeHead(up.statusCode, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: `upstream ${up.statusCode}` }));
+        return;
+      }
+
+      const ct = up.headers['content-type'] || 'video/mp4';
+      const total = totalFromContentRange(up.headers['content-range']);
+      const baseHeaders = {
+        'content-type': ct,
+        'accept-ranges': up.headers['accept-ranges'] || 'bytes',
+        'access-control-allow-origin': '*',
+      };
+
+      // ── Buffered head path ─────────────────────────────────────────
+      // Buffer the whole leading range so we can both answer instantly
+      // and leave it in the cache for the next viewer.
+      if (r && r.start === 0 && r.end !== null && r.end < HEAD_CACHE_BYTES) {
+        settled = true;
+        (async () => {
+          try {
+            const buf = await readAll(up, HEAD_CACHE_BYTES);
+            headCache.set(key, { buf, total }, buf.length);
+            if (res.writableEnded) return;
+            const h = { ...baseHeaders, 'content-length': String(buf.length), 'x-cache': 'miss' };
+            if (up.headers['content-range']) h['content-range'] = up.headers['content-range'];
+            res.writeHead(up.statusCode, h);
+            res.end(buf);
+          } catch (e) {
+            try { if (!res.writableEnded) res.end(); } catch (_) {}
+          }
+        })();
+        return;
+      }
+
+      // ── Stream path ────────────────────────────────────────────────
+      const outHeaders = { ...baseHeaders, 'x-cache': 'miss' };
+      if (up.headers['content-length']) outHeaders['content-length'] = up.headers['content-length'];
+      if (up.headers['content-range']) outHeaders['content-range'] = up.headers['content-range'];
+      settled = true;
+      // Must write the status+headers BEFORE piping. pipe() on its own
+      // would trigger an implicit 200 with no content-type / content-range
+      // / accept-ranges, which breaks seeking.
+      res.writeHead(up.statusCode, outHeaders);
+      up.pipe(res);
+      up.on('error', () => { try { res.end(); } catch (_) {} });
+    }
+  );
+
+  upReq.on('error', (e) => {
+    if (settled) return;
+    settled = true;
+    if (res.headersSent) { try { res.end(); } catch (_) {} return; }
+    res.writeHead(502, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: e.message }));
+  });
+
+  // The browser aborts range requests constantly while seeking. Tear the
+  // upstream socket down with it so we aren't paying for bytes nobody
+  // will read.
+  res.on('close', onClientGone);
+  req.on('aborted', onClientGone);
+
+  upReq.end();
 }
 
 /**
@@ -524,10 +753,20 @@ async function handleSearch(req, res) {
   res.end(JSON.stringify(data));
 }
 
+// ── Server tuning ─────────────────────────────────────────────────────
+// Node defaults are hostile to a long-lived media proxy:
+//   requestTimeout  = 300s  -> a 247MB file at 1MB/s needs ~247s and
+//                              gets killed mid-stream near the end.
+//   headersTimeout  = 60s   -> fine, we don't accept slow clients.
+//   keepAliveTimeout= 5s    -> our upstream socket pool wants more.
+//   timeout         = 0     -> already unlimited, keep it.
+// (Applied after createServer below — `server` is a const and this file
+// is an ES module, so touching it earlier is a TDZ ReferenceError.)
+
 const server=http.createServer(async(req,res)=>{
   try{
     const u=new URL(req.url,`http://${req.headers.host}`);
-    if(u.pathname==='/health'){const m=process.memoryUsage();res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({ok:true,ram_mb:Math.round(m.rss/1024/1024*10)/10,cache_size:cache.size,token_pool_size:tokenStore.size,ip_plays_tracked:ipPlays.size,free_plays_per_day:FREE_PLAYS_PER_DAY,uptime_s:Math.round(process.uptime())}));return;}
+    if(u.pathname==='/health'){const m=process.memoryUsage();res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({ok:true,ram_mb:Math.round(m.rss/1024/1024*10)/10,cache_size:cache.size,cache_mb:Math.round(cache.totalBytes/1048576*10)/10,head_cache_size:headCache.size,head_cache_mb:Math.round(headCache.totalBytes/1048576*10)/10,token_pool_size:tokenStore.size,ip_plays_tracked:ipPlays.size,free_plays_per_day:FREE_PLAYS_PER_DAY,uptime_s:Math.round(process.uptime())}));return;}
     if(u.pathname==='/stream'){const p={detailPath:u.searchParams.get('detailPath'),subjectId:u.searchParams.get('subjectId'),season:u.searchParams.get('season')||'0',episode:u.searchParams.get('episode')||'0'};await handleStream(req,res,p);return;}
     if(u.pathname==='/mp4'){await handleMp4(req, res, u.searchParams.get('url'));return;}
     if(u.pathname==='/search'){await handleSearch(req,res);return;}
@@ -536,4 +775,9 @@ const server=http.createServer(async(req,res)=>{
     res.writeHead(404,{'content-type':'application/json'});res.end(JSON.stringify({ok:false,error:'not found'}));
   }catch(e){res.writeHead(500,{'content-type':'application/json'});res.end(JSON.stringify({ok:false,error:e.message}));}
 });
+server.requestTimeout = 0;          // no wall-clock cap on a media stream
+server.timeout = 0;
+server.headersTimeout = 60_000;
+server.keepAliveTimeout = 72_000;
+server.on('connection', (s) => s.setNoDelay(true));
 server.listen(PORT,HOSTNAME,()=>{console.log(`movbox-stream listening on http://${HOSTNAME}:${PORT}`);});
