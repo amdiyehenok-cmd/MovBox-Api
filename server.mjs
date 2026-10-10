@@ -31,17 +31,32 @@ const HOSTNAME = process.env.HOST || '0.0.0.0';
 const PUBLIC_HOST = process.env.PUBLIC_HOST || '';
 
 // ── Upstream connection pool ───────────────────────────────────────────
-// Every media byte comes from one CDN host. Reusing the TLS connection
-// across requests removes a full TCP+TLS handshake from the critical
-// path of every range request (which the browser issues many of, while
-// seeking and rebuffering).
+// Every media byte comes from one CDN host.
+//
+// keepAlive is deliberately OFF. With a pool on, a socket the CDN has
+// already closed can be handed back out, and the request then hangs
+// forever — no response, no 'error' event, nothing to time out on. That
+// is exactly what happened in production: /health and /stream stayed
+// healthy while every /mp4 request sat there with zero bytes buffered,
+// which presented to the user as a player stuck on "Buffering…" forever.
+//
+// Reuse only saved a ~200ms TLS handshake. The latency that actually
+// matters is the 3MB moov, and that is solved by the head cache below.
+// Reliability wins that trade comfortably.
 const upstreamAgent = new https.Agent({
-  keepAlive: true,
-  keepAliveMsecs: 30_000,
-  maxSockets: 64,
-  maxFreeSockets: 16,
-  timeout: 0,
+  keepAlive: false,
+  maxSockets: 24,
 });
+
+/**
+ * How long to wait for the upstream to send RESPONSE HEADERS before
+ * giving up. Scoped to the header phase only — it is cleared the moment
+ * headers arrive, so a 250MB body can stream for as long as it needs.
+ *
+ * Without this, "upstream is silent" is indistinguishable from "upstream
+ * is slow", and the client waits forever.
+ */
+const UPSTREAM_HEADER_TIMEOUT_MS = 15000;
 
 // ── Generic byte-budgeted LRU ──────────────────────────────────────────
 // Bounded by bytes rather than entry count so one big buffer can't blow
@@ -569,40 +584,51 @@ async function handleMp4(req, res, url) {
   }
 
   let settled = false;
+  let upReq = null;
+  let retried = false;
   const onClientGone = () => {
     if (settled) return;
     settled = true;
-    try { upReq.destroy(); } catch (_) {}
+    try { upReq && upReq.destroy(); } catch (_) {}
     try { res.end(); } catch (_) {}
   };
 
-  const upReq = mod.request(
-    {
-      protocol: parsed.protocol,
-      hostname: parsed.hostname,
-      port: parsed.port || (parsed.protocol === 'http:' ? 80 : 443),
-      path: parsed.pathname + parsed.search,
-      method: 'GET',
-      headers: hdrs,
-      agent: upstreamAgent,
-      // The CDN must not hand us a redirect for media; a redirect here
-      // would silently drop our Origin/Referer and 429 the follow-up.
-      // undici's fetch(redirect:'follow') handled this; native does not.
-      // We surface it as an error instead of guessing.
-    },
-    (up) => {
+  const reqOptions = {
+    protocol: parsed.protocol,
+    hostname: parsed.hostname,
+    port: parsed.port || (parsed.protocol === 'http:' ? 80 : 443),
+    path: parsed.pathname + parsed.search,
+    method: 'GET',
+    headers: hdrs,
+    agent: upstreamAgent,
+    // The CDN must not hand us a redirect for media; a redirect here
+    // would silently drop our Origin/Referer and 429 the follow-up.
+    // undici's fetch(redirect:'follow') handled this; native does not.
+    // We surface it as an error instead of guessing.
+  };
+
+  function failClient(e) {
+    if (settled) return;
+    settled = true;
+    if (res.headersSent) { try { res.end(); } catch (_) {} return; }
+    res.writeHead(502, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: e && e.message ? e.message : 'upstream failed' }));
+  }
+
+  function openUpstream() {
+    upReq = mod.request(reqOptions, (up) => {
+      // Headers are in — stop guarding and let the body stream for as
+      // long as it needs. A 250MB file must never be cut off.
+      try { upReq.setTimeout(0); } catch (_) {}
+
       if (up.statusCode >= 300 && up.statusCode < 400 && up.headers.location) {
         up.resume();
-        settled = true;
-        res.writeHead(up.statusCode, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: `upstream redirect ${up.statusCode}` }));
+        failClient(new Error(`upstream redirect ${up.statusCode}`));
         return;
       }
       if (up.statusCode !== 206 && up.statusCode !== 200) {
         up.resume();
-        settled = true;
-        res.writeHead(up.statusCode, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ ok: false, error: `upstream ${up.statusCode}` }));
+        failClient(new Error(`upstream ${up.statusCode}`));
         return;
       }
 
@@ -646,16 +672,35 @@ async function handleMp4(req, res, url) {
       res.writeHead(up.statusCode, outHeaders);
       up.pipe(res);
       up.on('error', () => { try { res.end(); } catch (_) {} });
-    }
-  );
+    });
 
-  upReq.on('error', (e) => {
-    if (settled) return;
-    settled = true;
-    if (res.headersSent) { try { res.end(); } catch (_) {} return; }
-    res.writeHead(502, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: false, error: e.message }));
-  });
+    // ── Header-phase guard ────────────────────────────────────────────
+    // The only timeout in the whole request. It is cleared the instant
+    // response headers arrive, so it can only ever fire while we are
+    // waiting for the upstream to say something. Without it, a socket
+    // that never errors and never answers hangs the request forever —
+    // which is exactly how the player ended up buffering indefinitely.
+    upReq.setTimeout(UPSTREAM_HEADER_TIMEOUT_MS, () => {
+      upReq.destroy(new Error(`upstream did not respond within ${UPSTREAM_HEADER_TIMEOUT_MS}ms`));
+    });
+
+    upReq.on('error', (e) => {
+      if (settled) return;
+      // One retry on a fresh socket. A reused keep-alive socket that the
+      // CDN had already closed fails exactly like this: no response,
+      // ECONNRESET or hangup. Retrying once on a clean socket is cheap;
+      // looping would just mask a genuinely dead origin.
+      if (!retried) {
+        retried = true;
+        console.warn(`[mp4] ${e.message} — retrying on a fresh socket (${parsed.hostname})`);
+        openUpstream();
+        return;
+      }
+      failClient(e);
+    });
+
+    upReq.end();
+  }
 
   // The browser aborts range requests constantly while seeking. Tear the
   // upstream socket down with it so we aren't paying for bytes nobody
@@ -663,7 +708,7 @@ async function handleMp4(req, res, url) {
   res.on('close', onClientGone);
   req.on('aborted', onClientGone);
 
-  upReq.end();
+  openUpstream();
 }
 
 /**
