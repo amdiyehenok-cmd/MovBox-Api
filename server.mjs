@@ -54,9 +54,12 @@ const upstreamAgent = new https.Agent({
  * headers arrive, so a 250MB body can stream for as long as it needs.
  *
  * Without this, "upstream is silent" is indistinguishable from "upstream
- * is slow", and the client waits forever.
+ * is slow" and the client waits forever. Kept short on purpose: the
+ * player already has a source-fallback path and a 20s stall watchdog, and
+ * both are only useful if we fail FAST enough for them to fire. A slow
+ * failure just moves the hang one layer up.
  */
-const UPSTREAM_HEADER_TIMEOUT_MS = 15000;
+const UPSTREAM_HEADER_TIMEOUT_MS = 7000;
 
 // ── Generic byte-budgeted LRU ──────────────────────────────────────────
 // Bounded by bytes rather than entry count so one big buffer can't blow
@@ -798,6 +801,53 @@ async function handleSearch(req, res) {
   res.end(JSON.stringify(data));
 }
 
+// ── Upstream reachability probe ──────────────────────────────────────
+// /health used to be perfectly green while every /mp4 request hung for
+// 25s. The relay was fine; the CDN was refusing to answer this instance's
+// egress IP. A green liveness probe that says nothing about the thing we
+// actually depend on is worse than no probe at all.
+//
+// So: actively ask the CDN host whether it will talk to us at all. Any
+// HTTP status counts as "reachable" — 403/404/429 all prove the TCP
+// connection, TLS and request/response cycle completed. A timeout means
+// the origin is silently dropping us, which is the failure that actually
+// happens.
+const UPSTREAM_PROBE_URL = 'https://bcdnxw.hakunaymatata.com/';
+const upstreamProbe = { at: 0, reachable: null, ms: null, status: null, err: null };
+
+async function probeUpstream(force) {
+  const now = Date.now();
+  if (!force && now - upstreamProbe.at < 60_000) return upstreamProbe;
+  upstreamProbe.at = now;
+  const t0 = Date.now();
+  try {
+    const r = await fetch(UPSTREAM_PROBE_URL, {
+      headers: {
+        Origin: HOST,
+        Referer: `${HOST}/`,
+        'User-Agent': USER_AGENT,
+      },
+      redirect: 'manual',
+      signal: AbortSignal.timeout(8000),
+    });
+    upstreamProbe.reachable = true;
+    upstreamProbe.status = r.status;
+    upstreamProbe.ms = Date.now() - t0;
+    upstreamProbe.err = null;
+  } catch (e) {
+    upstreamProbe.reachable = false;
+    upstreamProbe.status = null;
+    upstreamProbe.ms = Date.now() - t0;
+    upstreamProbe.err = e && e.message ? e.message : 'probe failed';
+  }
+  return upstreamProbe;
+}
+probeUpstream(true).then((p) =>
+  console.log(`[upstream-probe] reachable=${p.reachable} status=${p.status} ms=${p.ms} err=${p.err}`)
+);
+// Keep the probe warm so /health can answer without waiting on it.
+setInterval(() => { probeUpstream(false); }, 60_000).unref();
+
 // ── Server tuning ─────────────────────────────────────────────────────
 // Node defaults are hostile to a long-lived media proxy:
 //   requestTimeout  = 300s  -> a 247MB file at 1MB/s needs ~247s and
@@ -811,7 +861,7 @@ async function handleSearch(req, res) {
 const server=http.createServer(async(req,res)=>{
   try{
     const u=new URL(req.url,`http://${req.headers.host}`);
-    if(u.pathname==='/health'){const m=process.memoryUsage();res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({ok:true,ram_mb:Math.round(m.rss/1024/1024*10)/10,cache_size:cache.size,cache_mb:Math.round(cache.totalBytes/1048576*10)/10,head_cache_size:headCache.size,head_cache_mb:Math.round(headCache.totalBytes/1048576*10)/10,token_pool_size:tokenStore.size,ip_plays_tracked:ipPlays.size,free_plays_per_day:FREE_PLAYS_PER_DAY,uptime_s:Math.round(process.uptime())}));return;}
+    if(u.pathname==='/health'){const m=process.memoryUsage();const up=await probeUpstream(false);res.writeHead(up.reachable?200:503,{'content-type':'application/json'});res.end(JSON.stringify({ok:true,ram_mb:Math.round(m.rss/1024/1024*10)/10,cache_size:cache.size,cache_mb:Math.round(cache.totalBytes/1048576*10)/10,head_cache_size:headCache.size,head_cache_mb:Math.round(headCache.totalBytes/1048576*10)/10,token_pool_size:tokenStore.size,ip_plays_tracked:ipPlays.size,free_plays_per_day:FREE_PLAYS_PER_DAY,upstream:{reachable:up.reachable,status:up.status,ms:up.ms,err:up.err},uptime_s:Math.round(process.uptime())}));return;}
     if(u.pathname==='/stream'){const p={detailPath:u.searchParams.get('detailPath'),subjectId:u.searchParams.get('subjectId'),season:u.searchParams.get('season')||'0',episode:u.searchParams.get('episode')||'0'};await handleStream(req,res,p);return;}
     if(u.pathname==='/mp4'){await handleMp4(req, res, u.searchParams.get('url'));return;}
     if(u.pathname==='/search'){await handleSearch(req,res);return;}
