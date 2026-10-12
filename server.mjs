@@ -26,6 +26,26 @@ import { URL } from 'node:url';
 
 const H5 = 'https://h5-api.aoneroom.com/wefeed-h5api-bff';
 const HOST = 'https://boxmovies.org';
+
+/**
+ * Which site the MEDIA proxy claims to be when it talks to the CDN.
+ *
+ * The upstream runs a Referer allowlist. Measured against the live CDN:
+ *
+ *   Referer: https://movibox.xyz/    -> 206 (allow-listed)
+ *   Referer: https://boxmovies.org/  -> 206 from an allow-listed IP, hangs otherwise
+ *   Referer: https://movbox.xyz/     -> 429 blocked
+ *   no Referer                       -> 429 blocked
+ *
+ * movbox.xyz is not on that allowlist, so the media bytes have to be
+ * proxied — but the proxy can present itself as the sister site, which
+ * is. Override with UPSTREAM_MEDIA_SITE if the allowlist changes.
+ *
+ * This is a stopgap. The permanent fix is to get movbox.xyz onto the
+ * allowlist too, after which the <video> element can fetch the CDN
+ * directly and this entire proxy can go away.
+ */
+const UPSTREAM_MEDIA_SITE = (process.env.UPSTREAM_MEDIA_SITE || 'https://movibox.xyz').replace(/\/+$/, '');
 const PORT = Number(process.env.PORT || 4000);
 const HOSTNAME = process.env.HOST || '0.0.0.0';
 const PUBLIC_HOST = process.env.PUBLIC_HOST || '';
@@ -552,8 +572,8 @@ async function handleMp4(req, res, url) {
   }
 
   const hdrs = {
-    Origin: HOST,
-    Referer: `${HOST}/`,
+    Origin: UPSTREAM_MEDIA_SITE,
+    Referer: `${UPSTREAM_MEDIA_SITE}/`,
     'User-Agent': USER_AGENT,
     'Accept-Encoding': 'identity',   // never let the CDN gzip media
   };
@@ -823,8 +843,8 @@ async function probeUpstream(force) {
   try {
     const r = await fetch(UPSTREAM_PROBE_URL, {
       headers: {
-        Origin: HOST,
-        Referer: `${HOST}/`,
+        Origin: UPSTREAM_MEDIA_SITE,
+        Referer: `${UPSTREAM_MEDIA_SITE}/`,
         'User-Agent': USER_AGENT,
       },
       redirect: 'manual',
