@@ -158,22 +158,15 @@ function cacheSet(k, d, ttl) {
   cache.set(k, { ts: Date.now(), ttl, data: d }, size);
 }
 
-// ── Media head cache ───────────────────────────────────────────────────
-// A progressive MP4 cannot decode a single frame until the browser has
-// downloaded the whole `moov` atom. Ours are ~3MB. Measured end to end
-// that moov download is the single largest contributor to time-to-first-
-// frame, and because every viewer of the same title asks for the same
-// byte range first, it is trivially cacheable.
+// ── Media chunk cache ──────────────────────────────────────────────────
+// Superseded the old 4MB "head cache", which asked the upstream for a 4MB
+// range in one request. The upstream accepts those headers and then goes
+// silent — see the 256KB ceiling documented above handleMp4. Chunks are now
+// fetched at the size the CDN actually honours and assembled here, so the
+// cache is what makes repeated playback instant and upstream-free.
 //
-// Key is the upstream PATH, not the full URL: the CDN rotates `sign` and
-// `t` on every request but the bytes behind a path never change.
-const HEAD_CACHE_BYTES = 4 * 1024 * 1024;      // covers our ~3MB moov
-const HEAD_CACHE_BUDGET = 128 * 1024 * 1024;   // ~32 titles resident
-const headCache = new ByteLRU(HEAD_CACHE_BUDGET);
-
-function headCacheKey(upstreamUrl) {
-  try { return new URL(upstreamUrl).pathname; } catch { return upstreamUrl; }
-}
+// Key is the upstream PATH, not the full URL: the CDN rotates `sign` and `t`
+// on every request but the bytes behind a path never change.
 // Per-endpoint TTLs. /stream metadata changes rarely (only when boxmovies
 // rotates their CDN URLs or a source goes down), /search results barely
 // change at all in a 1hr window, and /subtitle bodies are immutable once
@@ -434,6 +427,13 @@ async function handleStream(req,res,p){
   // CDN directly and gets rate-limited.
   const proxiedStreams=streams.map(s=>{
     if(!s.url) return s;
+    // Remember how to mint a FRESH signature for this media. Upstream signed
+    // URLs are single-use (see the note above handleMp4), so every later
+    // range request has to be able to re-mint for the same path.
+    try { rememberMediaOrigin(new URL(s.url).pathname, {
+      ip, detailPath: p.detailPath, subjectId: p.subjectId,
+      season: p.season || 0, episode: p.episode || 0,
+    }); } catch (_) {}
     return {...s,url:`${base}/mp4?url=${encodeURIComponent(s.url)}`};
   });
   const out={
@@ -551,10 +551,201 @@ function parseRange(hdr) {
 }
 
 // Pull the total file size out of a Content-Range header.
-function totalFromContentRange(cr) {
-  if (!cr) return null;
-  const m = /\/(\d+)\s*$/.exec(String(cr));
-  return m ? Number(m[1]) : null;
+
+// ── Upstream media access constraints (measured 2026-10-13) ────────────
+//
+// The CDN does not behave like a normal file host, and both of its limits
+// were invisible until they were measured:
+//
+//  1. RESPONSE SIZE CEILING. Measured on one fresh signature each:
+//       64KB  -> 200 OK in 0.6s
+//       128KB -> 200 OK in 0.6s
+//       256KB -> 200 OK in 0.6s
+//       512KB -> headers, then silence (stalls)
+//        1MB  -> headers, then silence (stalls)
+//       open  -> headers, then ~10KB, then silence
+//     Anything over 256KB is accepted with headers and then goes silent.
+//     This is why the 4MB head-cache read never populated from upstream and
+//     why playback died a few minutes in.
+//
+//  2. SIGNED URLS ARE SINGLE-USE. The `sign`/`t` query on each media URL is
+//     good for exactly ONE HTTP request. Measured on one signature, 256KB
+//     chunks: chunk 0 OK, chunks 1-3 stall — including when spaced 2s and
+//     5s apart, and including on a freshly minted signature. Only the first
+//     use of any given URL ever returns bytes.
+//
+// So a <video> element, which issues many range requests per playback, can
+// never be served from one signed URL. The relay has to:
+//   - never ask upstream for more than UPSTREAM_CHUNK bytes at a time, and
+//   - mint a FRESH signature for every one of those requests, and
+//   - cache the chunks so each byte crosses the network exactly once.
+//
+// Everything below implements exactly that.
+const UPSTREAM_CHUNK = 262144;              // 256KB — the proven safe ceiling
+const MAX_SERVE_WINDOW = 8 * UPSTREAM_CHUNK; // 2MB assembled per client request
+const SIGNED_URL_TTL_MS = 30 * 60 * 1000;
+const CHUNK_CACHE_BYTES = 384 * 1048576;
+
+/**
+ * Upstream pathname -> the identifiers needed to mint a fresh signature.
+ *
+ * Keyed on PATHNAME, not the full URL: the bytes behind a path are stable,
+ * only the signature rotates. Populated by /stream when it hands out the
+ * /mp4 links, so a range request arriving later can always work out how to
+ * re-mint.
+ */
+const mediaOrigin = new Map();
+
+/**
+ * Upstream pathname -> total file size.
+ *
+ * Captured from the `Content-Range: bytes a-b/TOTAL` header on the first
+ * successful chunk. The browser cannot seek a progressive MP4 without a real
+ * total, and the upstream is the only place that knows it.
+ */
+const mediaTotal = new Map();
+
+function rememberMediaOrigin(pathname, params) {
+  if (!pathname) return;
+  // Cheap bound: the map only ever holds paths someone is actively watching.
+  if (mediaOrigin.size > 500) {
+    const oldest = mediaOrigin.keys().next().value;
+    mediaOrigin.delete(oldest);
+  }
+  mediaOrigin.set(pathname, { ...params, at: Date.now() });
+}
+
+function lookupMediaOrigin(pathname) {
+  const e = mediaOrigin.get(pathname);
+  if (!e) return null;
+  if (Date.now() - e.at > SIGNED_URL_TTL_MS) {
+    mediaOrigin.delete(pathname);
+    return null;
+  }
+  return e;
+}
+
+/**
+ * Mint a fresh signed URL for the same media path.
+ *
+ * Only the signature changes; the pathname is stable across mints, which is
+ * what makes this usable as a cache key.
+ */
+async function remintSignedUrl(pathname) {
+  const e = lookupMediaOrigin(pathname);
+  if (!e) return null;
+  try {
+    // fetchPlay() derives its Bearer token from the client IP, so hand it a
+    // synthetic request carrying the IP that originally asked for this media.
+    const fakeReq = { headers: { 'x-forwarded-for': e.ip }, socket: {} };
+    const play = await fetchPlay(fakeReq, e.detailPath, e.subjectId, e.season, e.episode);
+    const streams = (play && play.data && play.data.streams) || [];
+    for (const s of streams) {
+      if (!s.url) continue;
+      try {
+        if (new URL(s.url).pathname === pathname) return s.url;
+      } catch (_) { /* skip malformed */ }
+    }
+    return null;
+  } catch (err) {
+    console.warn(`[mp4] re-mint failed for ${pathname}: ${err && err.message}`);
+    return null;
+  }
+}
+
+// Chunk cache, keyed "<pathname>#<chunkIndex>". Each entry is exactly
+// UPSTREAM_CHUNK bytes, so a seek into already-fetched territory is a
+// memcpy and never touches the CDN again.
+let chunkCacheBytes = 0;
+const chunkCache = new ByteLRU(CHUNK_CACHE_BYTES, (n) => { chunkCacheBytes -= n; });
+function chunkKey(pathname, index) { return `${pathname}#${index}`; }
+
+/**
+ * Fetch one UPSTREAM_CHUNK-sized slice, with a fresh signature on every try.
+ *
+ * Returns a Buffer of exactly the requested length, or null if the upstream
+ * could not satisfy it within the retry budget.
+ */
+async function fetchChunk(signedUrl, pathname, start, end, attempts) {
+  for (let i = 0; i < attempts; i++) {
+    // Every attempt burns the signature, so re-mint before retrying. The
+    // first attempt uses the URL we were handed.
+    const url = i === 0 ? signedUrl : await remintSignedUrl(pathname);
+    if (!url) return null;
+    try {
+      const up = await fetch(url, {
+        method: 'GET',
+        headers: {
+          Origin: UPSTREAM_MEDIA_SITE,
+          Referer: `${UPSTREAM_MEDIA_SITE}/`,
+          'User-Agent': USER_AGENT,
+          'Accept-Encoding': 'identity',
+          Range: `bytes=${start}-${end}`,
+        },
+        redirect: 'manual',
+        signal: AbortSignal.timeout(UPSTREAM_HEADER_TIMEOUT_MS),
+      });
+      if (up.status !== 206 && up.status !== 200) {
+        try { up.body && (await up.body.cancel()); } catch (_) {}
+        continue;
+      }
+      const buf = Buffer.from(await up.arrayBuffer());
+      const want = end - start + 1;
+      if (buf.length !== want) continue;   // partial = throttled, retry clean
+      // Capture the real file size so the client gets a usable Content-Range
+      // and can seek. "bytes a-b/*" is not seekable.
+      const cr = up.headers.get('content-range');
+      if (cr) {
+        const m = /\/(\d+)\s*$/.exec(cr);
+        if (m) mediaTotal.set(pathname, Number(m[1]));
+      }
+      return buf;
+    } catch (err) {
+      if (i === attempts - 1) {
+        console.warn(`[mp4] chunk ${pathname}@${start} failed: ${err && err.message}`);
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Assemble a byte window for the client from cached chunks, fetching only
+ * what is missing.
+ */
+async function assembleWindow(signedUrl, pathname, start, end) {
+  const out = Buffer.alloc(end - start + 1);
+  const jobs = [];
+  for (let off = start; off <= end; off += UPSTREAM_CHUNK) {
+    const chunkEnd = Math.min(off + UPSTREAM_CHUNK - 1, end);
+    const idx = Math.floor(off / UPSTREAM_CHUNK);
+    const key = chunkKey(pathname, idx);
+    const hit = chunkCache.get(key);
+    if (hit && hit.length === chunkEnd - off + 1) {
+      // Buffer.copy(target, targetStart) — data flows chunk -> window.
+      hit.copy(out, off - start);
+    } else {
+      jobs.push({ off, chunkEnd, idx, key });
+    }
+  }
+  if (!jobs.length) return out;
+
+  // Small concurrency: enough to keep the window filling, not enough to look
+  // like a burst to an upstream that is already sensitive to request rate.
+  const CONCURRENCY = 3;
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < jobs.length) {
+      const job = jobs[cursor++];
+      const buf = await fetchChunk(signedUrl, pathname, job.off, job.chunkEnd, 3);
+      if (!buf) throw new Error(`upstream chunk ${job.off} unavailable`);
+      chunkCache.set(job.key, buf, buf.length);
+      chunkCacheBytes += buf.length;
+      buf.copy(out, job.off - start);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, jobs.length) }, worker));
+  return out;
 }
 
 async function handleMp4(req, res, url) {
@@ -564,151 +755,67 @@ async function handleMp4(req, res, url) {
     return;
   }
 
-  const hdrs = {
-    Origin: UPSTREAM_MEDIA_SITE,
-    Referer: `${UPSTREAM_MEDIA_SITE}/`,
-    'User-Agent': USER_AGENT,
-    'Accept-Encoding': 'identity',   // never let the CDN gzip media
-  };
-  const rangeHeader = req.headers['range'];
-  if (rangeHeader) hdrs['Range'] = rangeHeader;
-
-  const parsed = new URL(url);
-  const key = headCacheKey(url);
-
-  // ── Head-cache fast path ───────────────────────────────────────────
-  // Only for explicit bounded ranges starting at byte 0 — that is the
-  // shape a <video> element issues while it fetches the index.
-  const r = parseRange(rangeHeader);
-  if (r && r.start === 0 && r.end !== null && r.end < HEAD_CACHE_BYTES) {
-    const hit = headCache.get(key);
-    if (hit && hit.buf.length >= r.end + 1) {
-      const slice = hit.buf.subarray(0, r.end + 1);
-      const cr = `bytes 0-${r.end}/${hit.total || hit.buf.length}`;
-      res.writeHead(206, {
-        'content-type': 'video/mp4',
-        'content-length': String(slice.length),
-        'content-range': cr,
-        'accept-ranges': 'bytes',
-        'access-control-allow-origin': '*',
-        'x-cache': 'hit',
-      });
-      res.end(slice);
-      return;
-    }
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'bad url' }));
+    return;
   }
+  const pathname = parsed.pathname;
+
+  const r = parseRange(req.headers['range']);
+
+  // Work out the window we will actually serve.
+  let start = 0;
+  let end;
+  if (r && r.start !== null) {
+    start = r.start;
+    end = r.end !== null ? r.end : start + MAX_SERVE_WINDOW - 1;
+  } else {
+    // No Range at all: hand back the head, which is what a player wants
+    // first anyway, and let it ask for more.
+    start = 0;
+    end = MAX_SERVE_WINDOW - 1;
+  }
+  // Never let the client ask upstream for more than the ceiling allows, in
+  // total, per request. Larger requests are answered in several round trips
+  // by the browser, which is exactly how a <video> already behaves.
+  if (end - start + 1 > MAX_SERVE_WINDOW) end = start + MAX_SERVE_WINDOW - 1;
 
   let settled = false;
-  let ctrl = null;
-  let timer = null;
-  let bodyStream = null;
-
-  const armDeadline = (ms) => {
-    ctrl = new AbortController();
-    // Armed BEFORE the request leaves the process. The previous transport
-    // used req.setTimeout(), which cannot fire until Node already holds a
-    // socket — so a DNS/connect stall had no timer at all and the request
-    // hung indefinitely. In production /mp4 sat for 90s+ with zero bytes
-    // while this deadline simply never started.
-    timer = setTimeout(() => {
-      try { ctrl.abort(new Error(`upstream did not respond within ${ms}ms`)); } catch (_) {}
-    }, ms);
-    if (timer.unref) timer.unref();
-  };
-  const clearDeadline = () => { if (timer) { clearTimeout(timer); timer = null; } };
-
-  const failClient = (e) => {
-    if (settled) return;
-    settled = true;
-    clearDeadline();
-    if (res.headersSent) { try { res.end(); } catch (_) {} return; }
-    res.writeHead(502, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: false, error: e && e.message ? e.message : 'upstream failed' }));
-  };
-
-  // The browser aborts range requests constantly while seeking. Tear the
-  // upstream down with it so we aren't paying for bytes nobody will read.
   const onClientGone = () => {
     if (settled) return;
     settled = true;
-    clearDeadline();
-    try { ctrl && ctrl.abort(); } catch (_) {}
-    try { bodyStream && bodyStream.destroy(); } catch (_) {}
     try { res.end(); } catch (_) {}
   };
   res.on('close', onClientGone);
   req.on('aborted', onClientGone);
 
-  async function attempt(retried) {
-    armDeadline(UPSTREAM_HEADER_TIMEOUT_MS);
-    try {
-      // undici fetch — the same transport /health already uses, measured
-      // answering this origin from this same Cloud Run instance in ~38ms.
-      const up = await fetch(parsed, {
-        method: 'GET',
-        headers: hdrs,
-        redirect: 'manual',
-        signal: ctrl.signal,
-      });
+  try {
+    const buf = await assembleWindow(url, pathname, start, end);
+    if (settled) return;
+    settled = true;
 
-      const ct = up.headers.get('content-type') || 'video/mp4';
-      const total = totalFromContentRange(up.headers.get('content-range'));
-      const cr = up.headers.get('content-range');
-      const cl = up.headers.get('content-length');
-      const baseHeaders = {
-        'content-type': ct,
-        'accept-ranges': up.headers.get('accept-ranges') || 'bytes',
-        'access-control-allow-origin': '*',
-      };
-
-      // ── Buffered head path ─────────────────────────────────────────
-      // Buffer the whole leading range so we can both answer instantly and
-      // leave it in the cache for the next viewer. It is bounded (< 4MB), so
-      // the deadline stays armed here — a stalled body must not hang either.
-      if (r && r.start === 0 && r.end !== null && r.end < HEAD_CACHE_BYTES) {
-        armDeadline(HEAD_CACHE_BODY_TIMEOUT_MS);
-        const buf = Buffer.from(await up.arrayBuffer());
-        clearDeadline();
-        headCache.set(key, { buf, total }, buf.length);
-        if (res.writableEnded || settled) return;
-        settled = true;
-        const h = { ...baseHeaders, 'content-length': String(buf.length), 'x-cache': 'miss' };
-        if (cr) h['content-range'] = cr;
-        res.writeHead(up.status, h);
-        res.end(buf);
-        return;
-      }
-
-      // ── Stream path ────────────────────────────────────────────────
-      // Headers are in and this is an unbounded body: a 250MB file must
-      // never be cut off, so the deadline is dropped here and only here.
-      clearDeadline();
-      if (res.writableEnded || settled) return;
-      settled = true;
-      const outHeaders = { ...baseHeaders, 'x-cache': 'miss' };
-      if (cl) outHeaders['content-length'] = cl;
-      if (cr) outHeaders['content-range'] = cr;
-      // Status + headers MUST be written before piping; pipe() on its own
-      // triggers an implicit 200 with no content-range, which breaks seeking.
-      res.writeHead(up.status, outHeaders);
-      bodyStream = Readable.fromWeb(up.body);
-      bodyStream.on('error', () => { try { res.end(); } catch (_) {} });
-      bodyStream.pipe(res);
-    } catch (e) {
-      if (settled) return;
-      clearDeadline();
-      // One retry. A half-open pooled connection fails exactly like this:
-      // no response, no error, nothing to time out on. Retrying once on a
-      // clean connection is cheap; looping would mask a dead origin.
-      if (!retried) {
-        console.warn(`[mp4] ${e && e.message} — retrying once (${parsed.hostname})`);
-        return attempt(true);
-      }
-      failClient(e);
-    }
+    const total = mediaTotal.get(pathname) || 0;
+    const cr = `bytes ${start}-${start + buf.length - 1}/${total || '*'}`;
+    res.writeHead(206, {
+      'content-type': 'video/mp4',
+      'content-length': String(buf.length),
+      'content-range': cr,
+      'accept-ranges': 'bytes',
+      'access-control-allow-origin': '*',
+      'x-cache': chunkCache.get(chunkKey(pathname, Math.floor(start / UPSTREAM_CHUNK))) ? 'hit' : 'miss',
+    });
+    res.end(buf);
+  } catch (err) {
+    if (settled) return;
+    settled = true;
+    const msg = err && err.message ? err.message : 'upstream failed';
+    res.writeHead(502, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: msg }));
   }
-
-  attempt(false);
 }
 
 /**
@@ -858,7 +965,7 @@ setInterval(() => { probeUpstream(false); }, 60_000).unref();
 const server=http.createServer(async(req,res)=>{
   try{
     const u=new URL(req.url,`http://${req.headers.host}`);
-    if(u.pathname==='/health'){const m=process.memoryUsage();const up=await probeUpstream(false);res.writeHead(up.reachable?200:503,{'content-type':'application/json'});res.end(JSON.stringify({ok:true,ram_mb:Math.round(m.rss/1024/1024*10)/10,cache_size:cache.size,cache_mb:Math.round(cache.totalBytes/1048576*10)/10,head_cache_size:headCache.size,head_cache_mb:Math.round(headCache.totalBytes/1048576*10)/10,token_pool_size:tokenStore.size,ip_plays_tracked:ipPlays.size,free_plays_per_day:FREE_PLAYS_PER_DAY,upstream:{reachable:up.reachable,status:up.status,ms:up.ms,err:up.err},uptime_s:Math.round(process.uptime())}));return;}
+    if(u.pathname==='/health'){const m=process.memoryUsage();const up=await probeUpstream(false);res.writeHead(up.reachable?200:503,{'content-type':'application/json'});res.end(JSON.stringify({ok:true,ram_mb:Math.round(m.rss/1024/1024*10)/10,cache_size:cache.size,cache_mb:Math.round(cache.totalBytes/1048576*10)/10,chunk_cache_size:chunkCache.size,chunk_cache_mb:Math.round(chunkCacheBytes/1048576*10)/10,token_pool_size:tokenStore.size,ip_plays_tracked:ipPlays.size,free_plays_per_day:FREE_PLAYS_PER_DAY,upstream:{reachable:up.reachable,status:up.status,ms:up.ms,err:up.err},uptime_s:Math.round(process.uptime())}));return;}
     if(u.pathname==='/stream'){const p={detailPath:u.searchParams.get('detailPath'),subjectId:u.searchParams.get('subjectId'),season:u.searchParams.get('season')||'0',episode:u.searchParams.get('episode')||'0'};await handleStream(req,res,p);return;}
     if(u.pathname==='/mp4'){await handleMp4(req, res, u.searchParams.get('url'));return;}
     if(u.pathname==='/search'){await handleSearch(req,res);return;}
