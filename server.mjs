@@ -21,8 +21,8 @@
 // get a 401 — easy to detect and rotate.
 
 import http from 'node:http';
-import https from 'node:https';
 import { URL } from 'node:url';
+import { Readable } from 'node:stream';
 
 const H5 = 'https://h5-api.aoneroom.com/wefeed-h5api-bff';
 const HOST = 'https://boxmovies.org';
@@ -50,23 +50,21 @@ const PORT = Number(process.env.PORT || 4000);
 const HOSTNAME = process.env.HOST || '0.0.0.0';
 const PUBLIC_HOST = process.env.PUBLIC_HOST || '';
 
-// ── Upstream connection pool ───────────────────────────────────────────
-// Every media byte comes from one CDN host.
+// ── Upstream transport ─────────────────────────────────────────────────
+// Every media byte comes from one CDN host, fetched with undici's `fetch`.
 //
-// keepAlive is deliberately OFF. With a pool on, a socket the CDN has
-// already closed can be handed back out, and the request then hangs
-// forever — no response, no 'error' event, nothing to time out on. That
-// is exactly what happened in production: /health and /stream stayed
-// healthy while every /mp4 request sat there with zero bytes buffered,
-// which presented to the user as a player stuck on "Buffering…" forever.
+// This was a hand-rolled `https.request` + `https.Agent` pool. It worked in
+// local testing and hung forever in production, and the reason matters: the
+// only guard on it was `req.setTimeout(7000)`, which Node cannot fire until
+// the request already holds a socket. A stall in DNS/TCP/TLS therefore had no
+// timer at all. Measured on the live service: /mp4 sat 90s+ with zero bytes
+// and never returned, while /health — same process, same origin, same host,
+// but using `fetch` — answered in 38ms.
 //
-// Reuse only saved a ~200ms TLS handshake. The latency that actually
-// matters is the 3MB moov, and that is solved by the head cache below.
-// Reliability wins that trade comfortably.
-const upstreamAgent = new https.Agent({
-  keepAlive: false,
-  maxSockets: 24,
-});
+// So the transport is now the one that demonstrably reaches this origin from
+// this instance, and the deadline is armed before the request is issued
+// rather than after a socket appears. KeepAlive/pool tuning is now undici's
+// problem; it manages connection lifecycle correctly on its own.
 
 /**
  * How long to wait for the upstream to send RESPONSE HEADERS before
@@ -80,6 +78,17 @@ const upstreamAgent = new https.Agent({
  * failure just moves the hang one layer up.
  */
 const UPSTREAM_HEADER_TIMEOUT_MS = 7000;
+
+/**
+ * How long the bounded head read (< HEAD_CACHE_BYTES) may take end-to-end.
+ *
+ * The unbounded stream path deliberately has NO body deadline — a 250MB file
+ * must never be cut off. The head path is different: it is capped at 4MB, so
+ * a deadline here costs nothing and closes the last way a request could hang
+ * forever. Without it, a body that stalls after headers arrive has no timer
+ * at all.
+ */
+const HEAD_CACHE_BODY_TIMEOUT_MS = 30000;
 
 // ── Generic byte-budgeted LRU ──────────────────────────────────────────
 // Bounded by bytes rather than entry count so one big buffer can't blow
@@ -548,22 +557,6 @@ function totalFromContentRange(cr) {
   return m ? Number(m[1]) : null;
 }
 
-// Collect an entire upstream response into a Buffer, with a hard cap so
-// a malformed/huge response can never exhaust the container.
-function readAll(res, limitBytes) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let got = 0;
-    res.on('data', (c) => {
-      got += c.length;
-      if (got > limitBytes) { res.destroy(); reject(new Error('head too large')); return; }
-      chunks.push(c);
-    });
-    res.on('end', () => resolve(Buffer.concat(chunks, got)));
-    res.on('error', reject);
-  });
-}
-
 async function handleMp4(req, res, url) {
   if (!url) {
     res.writeHead(400, { 'content-type': 'application/json' });
@@ -581,7 +574,6 @@ async function handleMp4(req, res, url) {
   if (rangeHeader) hdrs['Range'] = rangeHeader;
 
   const parsed = new URL(url);
-  const mod = parsed.protocol === 'http:' ? http : https;
   const key = headCacheKey(url);
 
   // ── Head-cache fast path ───────────────────────────────────────────
@@ -607,131 +599,116 @@ async function handleMp4(req, res, url) {
   }
 
   let settled = false;
-  let upReq = null;
-  let retried = false;
-  const onClientGone = () => {
+  let ctrl = null;
+  let timer = null;
+  let bodyStream = null;
+
+  const armDeadline = (ms) => {
+    ctrl = new AbortController();
+    // Armed BEFORE the request leaves the process. The previous transport
+    // used req.setTimeout(), which cannot fire until Node already holds a
+    // socket — so a DNS/connect stall had no timer at all and the request
+    // hung indefinitely. In production /mp4 sat for 90s+ with zero bytes
+    // while this deadline simply never started.
+    timer = setTimeout(() => {
+      try { ctrl.abort(new Error(`upstream did not respond within ${ms}ms`)); } catch (_) {}
+    }, ms);
+    if (timer.unref) timer.unref();
+  };
+  const clearDeadline = () => { if (timer) { clearTimeout(timer); timer = null; } };
+
+  const failClient = (e) => {
     if (settled) return;
     settled = true;
-    try { upReq && upReq.destroy(); } catch (_) {}
-    try { res.end(); } catch (_) {}
-  };
-
-  const reqOptions = {
-    protocol: parsed.protocol,
-    hostname: parsed.hostname,
-    port: parsed.port || (parsed.protocol === 'http:' ? 80 : 443),
-    path: parsed.pathname + parsed.search,
-    method: 'GET',
-    headers: hdrs,
-    agent: upstreamAgent,
-    // The CDN must not hand us a redirect for media; a redirect here
-    // would silently drop our Origin/Referer and 429 the follow-up.
-    // undici's fetch(redirect:'follow') handled this; native does not.
-    // We surface it as an error instead of guessing.
-  };
-
-  function failClient(e) {
-    if (settled) return;
-    settled = true;
+    clearDeadline();
     if (res.headersSent) { try { res.end(); } catch (_) {} return; }
     res.writeHead(502, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ ok: false, error: e && e.message ? e.message : 'upstream failed' }));
-  }
+  };
 
-  function openUpstream() {
-    upReq = mod.request(reqOptions, (up) => {
-      // Headers are in — stop guarding and let the body stream for as
-      // long as it needs. A 250MB file must never be cut off.
-      try { upReq.setTimeout(0); } catch (_) {}
+  // The browser aborts range requests constantly while seeking. Tear the
+  // upstream down with it so we aren't paying for bytes nobody will read.
+  const onClientGone = () => {
+    if (settled) return;
+    settled = true;
+    clearDeadline();
+    try { ctrl && ctrl.abort(); } catch (_) {}
+    try { bodyStream && bodyStream.destroy(); } catch (_) {}
+    try { res.end(); } catch (_) {}
+  };
+  res.on('close', onClientGone);
+  req.on('aborted', onClientGone);
 
-      if (up.statusCode >= 300 && up.statusCode < 400 && up.headers.location) {
-        up.resume();
-        failClient(new Error(`upstream redirect ${up.statusCode}`));
-        return;
-      }
-      if (up.statusCode !== 206 && up.statusCode !== 200) {
-        up.resume();
-        failClient(new Error(`upstream ${up.statusCode}`));
-        return;
-      }
+  async function attempt(retried) {
+    armDeadline(UPSTREAM_HEADER_TIMEOUT_MS);
+    try {
+      // undici fetch — the same transport /health already uses, measured
+      // answering this origin from this same Cloud Run instance in ~38ms.
+      const up = await fetch(parsed, {
+        method: 'GET',
+        headers: hdrs,
+        redirect: 'manual',
+        signal: ctrl.signal,
+      });
 
-      const ct = up.headers['content-type'] || 'video/mp4';
-      const total = totalFromContentRange(up.headers['content-range']);
+      const ct = up.headers.get('content-type') || 'video/mp4';
+      const total = totalFromContentRange(up.headers.get('content-range'));
+      const cr = up.headers.get('content-range');
+      const cl = up.headers.get('content-length');
       const baseHeaders = {
         'content-type': ct,
-        'accept-ranges': up.headers['accept-ranges'] || 'bytes',
+        'accept-ranges': up.headers.get('accept-ranges') || 'bytes',
         'access-control-allow-origin': '*',
       };
 
       // ── Buffered head path ─────────────────────────────────────────
-      // Buffer the whole leading range so we can both answer instantly
-      // and leave it in the cache for the next viewer.
+      // Buffer the whole leading range so we can both answer instantly and
+      // leave it in the cache for the next viewer. It is bounded (< 4MB), so
+      // the deadline stays armed here — a stalled body must not hang either.
       if (r && r.start === 0 && r.end !== null && r.end < HEAD_CACHE_BYTES) {
+        armDeadline(HEAD_CACHE_BODY_TIMEOUT_MS);
+        const buf = Buffer.from(await up.arrayBuffer());
+        clearDeadline();
+        headCache.set(key, { buf, total }, buf.length);
+        if (res.writableEnded || settled) return;
         settled = true;
-        (async () => {
-          try {
-            const buf = await readAll(up, HEAD_CACHE_BYTES);
-            headCache.set(key, { buf, total }, buf.length);
-            if (res.writableEnded) return;
-            const h = { ...baseHeaders, 'content-length': String(buf.length), 'x-cache': 'miss' };
-            if (up.headers['content-range']) h['content-range'] = up.headers['content-range'];
-            res.writeHead(up.statusCode, h);
-            res.end(buf);
-          } catch (e) {
-            try { if (!res.writableEnded) res.end(); } catch (_) {}
-          }
-        })();
+        const h = { ...baseHeaders, 'content-length': String(buf.length), 'x-cache': 'miss' };
+        if (cr) h['content-range'] = cr;
+        res.writeHead(up.status, h);
+        res.end(buf);
         return;
       }
 
       // ── Stream path ────────────────────────────────────────────────
-      const outHeaders = { ...baseHeaders, 'x-cache': 'miss' };
-      if (up.headers['content-length']) outHeaders['content-length'] = up.headers['content-length'];
-      if (up.headers['content-range']) outHeaders['content-range'] = up.headers['content-range'];
+      // Headers are in and this is an unbounded body: a 250MB file must
+      // never be cut off, so the deadline is dropped here and only here.
+      clearDeadline();
+      if (res.writableEnded || settled) return;
       settled = true;
-      // Must write the status+headers BEFORE piping. pipe() on its own
-      // would trigger an implicit 200 with no content-type / content-range
-      // / accept-ranges, which breaks seeking.
-      res.writeHead(up.statusCode, outHeaders);
-      up.pipe(res);
-      up.on('error', () => { try { res.end(); } catch (_) {} });
-    });
-
-    // ── Header-phase guard ────────────────────────────────────────────
-    // The only timeout in the whole request. It is cleared the instant
-    // response headers arrive, so it can only ever fire while we are
-    // waiting for the upstream to say something. Without it, a socket
-    // that never errors and never answers hangs the request forever —
-    // which is exactly how the player ended up buffering indefinitely.
-    upReq.setTimeout(UPSTREAM_HEADER_TIMEOUT_MS, () => {
-      upReq.destroy(new Error(`upstream did not respond within ${UPSTREAM_HEADER_TIMEOUT_MS}ms`));
-    });
-
-    upReq.on('error', (e) => {
+      const outHeaders = { ...baseHeaders, 'x-cache': 'miss' };
+      if (cl) outHeaders['content-length'] = cl;
+      if (cr) outHeaders['content-range'] = cr;
+      // Status + headers MUST be written before piping; pipe() on its own
+      // triggers an implicit 200 with no content-range, which breaks seeking.
+      res.writeHead(up.status, outHeaders);
+      bodyStream = Readable.fromWeb(up.body);
+      bodyStream.on('error', () => { try { res.end(); } catch (_) {} });
+      bodyStream.pipe(res);
+    } catch (e) {
       if (settled) return;
-      // One retry on a fresh socket. A reused keep-alive socket that the
-      // CDN had already closed fails exactly like this: no response,
-      // ECONNRESET or hangup. Retrying once on a clean socket is cheap;
-      // looping would just mask a genuinely dead origin.
+      clearDeadline();
+      // One retry. A half-open pooled connection fails exactly like this:
+      // no response, no error, nothing to time out on. Retrying once on a
+      // clean connection is cheap; looping would mask a dead origin.
       if (!retried) {
-        retried = true;
-        console.warn(`[mp4] ${e.message} — retrying on a fresh socket (${parsed.hostname})`);
-        openUpstream();
-        return;
+        console.warn(`[mp4] ${e && e.message} — retrying once (${parsed.hostname})`);
+        return attempt(true);
       }
       failClient(e);
-    });
-
-    upReq.end();
+    }
   }
 
-  // The browser aborts range requests constantly while seeking. Tear the
-  // upstream socket down with it so we aren't paying for bytes nobody
-  // will read.
-  res.on('close', onClientGone);
-  req.on('aborted', onClientGone);
-
-  openUpstream();
+  attempt(false);
 }
 
 /**
