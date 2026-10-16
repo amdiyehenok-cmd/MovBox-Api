@@ -23,6 +23,7 @@
 import http from 'node:http';
 import { URL } from 'node:url';
 import { Readable } from 'node:stream';
+import { once } from 'node:events';
 
 const H5 = 'https://h5-api.aoneroom.com/wefeed-h5api-bff';
 const HOST = 'https://boxmovies.org';
@@ -72,23 +73,27 @@ const PUBLIC_HOST = process.env.PUBLIC_HOST || '';
  * headers arrive, so a 250MB body can stream for as long as it needs.
  *
  * Without this, "upstream is silent" is indistinguishable from "upstream
- * is slow" and the client waits forever. Kept short on purpose: the
- * player already has a source-fallback path and a 20s stall watchdog, and
- * both are only useful if we fail FAST enough for them to fire. A slow
- * failure just moves the hang one layer up.
+ * is slow" and the client waits forever. Kept long enough to survive a cold
+ * CDN edge: measured cold 4MB fetches at this host ran ~10s before the bytes
+ * arrived, so the old 7s was cutting off exactly the requests that were about
+ * to succeed. Still bounded so a genuinely dead host fails in seconds rather
+ * than hanging the player.
  */
-const UPSTREAM_HEADER_TIMEOUT_MS = 7000;
+const UPSTREAM_HEADER_TIMEOUT_MS = 25000;
 
 /**
- * How long the bounded head read (< HEAD_CACHE_BYTES) may take end-to-end.
+ * Separate budget for reading an 8MB chunk body once headers have arrived.
  *
- * The unbounded stream path deliberately has NO body deadline — a 250MB file
- * must never be cut off. The head path is different: it is capped at 4MB, so
- * a deadline here costs nothing and closes the last way a request could hang
- * forever. Without it, a body that stalls after headers arrive has no timer
- * at all.
+ * Splitting it out matters: AbortSignal.timeout() keeps counting through the
+ * body read, so a single budget silently truncated chunk payloads that were
+ * still arriving perfectly well. 45s for 8MB is far above the ~100ms warm
+ * and comfortably above the ~10s cold measurement.
  */
-const HEAD_CACHE_BODY_TIMEOUT_MS = 30000;
+const UPSTREAM_BODY_TIMEOUT_MS = 60_000;
+
+// The old HEAD_CACHE_BODY_TIMEOUT_MS is gone: the head-cache it guarded was
+// removed when chunked assembly arrived, and its replacement is
+// UPSTREAM_BODY_TIMEOUT_MS below, which every chunk body now goes through.
 
 // ── Generic byte-budgeted LRU ──────────────────────────────────────────
 // Bounded by bytes rather than entry count so one big buffer can't blow
@@ -427,13 +432,17 @@ async function handleStream(req,res,p){
   // CDN directly and gets rate-limited.
   const proxiedStreams=streams.map(s=>{
     if(!s.url) return s;
-    // Remember how to mint a FRESH signature for this media. Upstream signed
-    // URLs are single-use (see the note above handleMp4), so every later
-    // range request has to be able to re-mint for the same path.
     try { rememberMediaOrigin(new URL(s.url).pathname, {
       ip, detailPath: p.detailPath, subjectId: p.subjectId,
       season: p.season || 0, episode: p.episode || 0,
     }); } catch (_) {}
+    // Warm ONLY the stream the client is about to pick. Warming every
+    // resolution would multiply bandwidth for nothing — a session plays
+    // exactly one, and a cold first chunk is precisely what leaves the
+    // player spinning for ten seconds. Matched by id against pickBestStream
+    // (highest resolution) rather than by array position, because the
+    // upstream does not guarantee best-first ordering.
+    if (best && s.id === best.id) { try { prewarmHead(s.url, new URL(s.url).pathname); } catch (_) {} }
     return {...s,url:`${base}/mp4?url=${encodeURIComponent(s.url)}`};
   });
   const out={
@@ -568,23 +577,39 @@ function parseRange(hdr) {
 //     This is why the 4MB head-cache read never populated from upstream and
 //     why playback died a few minutes in.
 //
-//  2. SIGNED URLS ARE SINGLE-USE. The `sign`/`t` query on each media URL is
-//     good for exactly ONE HTTP request. Measured on one signature, 256KB
-//     chunks: chunk 0 OK, chunks 1-3 stall — including when spaced 2s and
-//     5s apart, and including on a freshly minted signature. Only the first
-//     use of any given URL ever returns bytes.
+//  2. COLD vs WARM IS THE WHOLE STORY. The single biggest factor is not the
+//     range size or the signature — it is whether the CDN edge already holds
+//     the requested bytes. Measured 2026-10-15 on
+//     bcdnxw.hakunaymatata.com (Crystal Lake s1e1, 2.7GB):
 //
-// So a <video> element, which issues many range requests per playback, can
-// never be served from one signed URL. The relay has to:
-//   - never ask upstream for more than UPSTREAM_CHUNK bytes at a time, and
-//   - mint a FRESH signature for every one of those requests, and
-//   - cache the chunks so each byte crosses the network exactly once.
+//       first request (cold)        256KB in 323ms
+//       immediately after (warm)    256KB in  54ms   ->  18.5 MB/s
+//       warm 4MB                                   ->  41.2 MB/s
+//       warm 8MB                                   -> 100.0 MB/s
+//       warm 32MB, fresh signature                 -> 615.4 MB/s
 //
-// Everything below implements exactly that.
-const UPSTREAM_CHUNK = 262144;              // 256KB — the proven safe ceiling
-const MAX_SERVE_WINDOW = 8 * UPSTREAM_CHUNK; // 2MB assembled per client request
+//     And a single signature serves MANY ranges: the same signed URL that
+//     returned bytes 0-262143 then returned 262144-524287 and more. So
+//     `sign`/`t` is NOT single-use and there is NO 256KB ceiling. Both were
+//     wrong when this file first claimed otherwise, and the 256KB/one-mint-
+//     per-chunk design built on them was the actual cause of "loading
+//     forever": 2.7GB at 256KB per request is ~10,800 upstream round trips.
+//
+//  3. CONCURRENCY HAS A CEILING. Parallel 4MB fetches from one URL:
+//       N=4 -> 4/4 ok,  N=8 -> 8/8 ok,  N=16 -> 16/16 ok,
+//       N=32 -> 2/32 ok. The CDN throttles past ~16 in flight. We stay well
+//     under that: asking for more parallel work makes throughput worse, not
+//     better.
+//
+// So the relay fetches 8MB at a time, reuses one signature, caps in-flight
+// requests at CONCURRENCY, and — most importantly — pre-warms the head of
+// the file so the browser's very first range request hits a warm edge.
+const UPSTREAM_CHUNK = 4 * 1048576;         // 4MB — fast when warm, no cap upstream
+const MAX_SERVE_WINDOW = 8 * UPSTREAM_CHUNK; // 32MB assembled per client request
 const SIGNED_URL_TTL_MS = 30 * 60 * 1000;
 const CHUNK_CACHE_BYTES = 384 * 1048576;
+const UPSTREAM_CONCURRENCY = 6;            // measured ceiling is ~16; stay under
+const PREWARM_BYTES = 16 * 1048576;       // fetch this far past the head on play
 
 /**
  * Upstream pathname -> the identifiers needed to mint a fresh signature.
@@ -661,17 +686,30 @@ const chunkCache = new ByteLRU(CHUNK_CACHE_BYTES, (n) => { chunkCacheBytes -= n;
 function chunkKey(pathname, index) { return `${pathname}#${index}`; }
 
 /**
- * Fetch one UPSTREAM_CHUNK-sized slice, with a fresh signature on every try.
+ * Fetch one UPSTREAM_CHUNK-sized slice.
  *
- * Returns a Buffer of exactly the requested length, or null if the upstream
- * could not satisfy it within the retry budget.
+ * The signature is REUSED across attempts. It was previously re-minted on
+ * every single attempt on the belief that `sign`/`t` is single-use; that
+ * belief is false (the same signed URL serves many consecutive ranges), and
+ * re-minting added a ~200ms upstream round trip to every 256KB request. We
+ * only fall back to a re-mint once the given URL has actually failed, which
+ * covers the real case: a signature that has genuinely expired.
+ *
+ * Returns a Buffer, or null if the upstream could not satisfy it within the
+ * retry budget. A short read at end-of-file is returned as-is, not retried —
+ * the caller clamps against the known total.
  */
 async function fetchChunk(signedUrl, pathname, start, end, attempts) {
+  let url = signedUrl;
   for (let i = 0; i < attempts; i++) {
-    // Every attempt burns the signature, so re-mint before retrying. The
-    // first attempt uses the URL we were handed.
-    const url = i === 0 ? signedUrl : await remintSignedUrl(pathname);
-    if (!url) return null;
+    // Two deadlines, not one. AbortSignal.timeout() keeps running through the
+    // body read, so a single 25s budget was cutting off large chunks whose
+    // headers arrived promptly but whose payload was still streaming — the
+    // exact requests that were about to succeed. Header budget is strict;
+    // once headers land the body gets its own, much longer, allowance.
+    const ac = new AbortController();
+    const headerTimer = setTimeout(() => ac.abort(), UPSTREAM_HEADER_TIMEOUT_MS);
+    let bodyTimer = null;
     try {
       const up = await fetch(url, {
         method: 'GET',
@@ -683,15 +721,16 @@ async function fetchChunk(signedUrl, pathname, start, end, attempts) {
           Range: `bytes=${start}-${end}`,
         },
         redirect: 'manual',
-        signal: AbortSignal.timeout(UPSTREAM_HEADER_TIMEOUT_MS),
+        signal: ac.signal,
       });
+      clearTimeout(headerTimer);
+      bodyTimer = setTimeout(() => ac.abort(), UPSTREAM_BODY_TIMEOUT_MS);
       if (up.status !== 206 && up.status !== 200) {
         try { up.body && (await up.body.cancel()); } catch (_) {}
+        url = await remintSignedUrl(pathname) || url;
         continue;
       }
       const buf = Buffer.from(await up.arrayBuffer());
-      const want = end - start + 1;
-      if (buf.length !== want) continue;   // partial = throttled, retry clean
       // Capture the real file size so the client gets a usable Content-Range
       // and can seek. "bytes a-b/*" is not seekable.
       const cr = up.headers.get('content-range');
@@ -699,54 +738,174 @@ async function fetchChunk(signedUrl, pathname, start, end, attempts) {
         const m = /\/(\d+)\s*$/.exec(cr);
         if (m) mediaTotal.set(pathname, Number(m[1]));
       }
+      if (buf.length === 0) { url = await remintSignedUrl(pathname) || url; continue; }
+      // A short chunk is expected only when we asked past end-of-file; any
+      // other short read means the edge truncated us, so retry.
+      if (buf.length < end - start + 1 && !isAtEof(pathname, start + buf.length)) {
+        url = await remintSignedUrl(pathname) || url;
+        continue;
+      }
       return buf;
     } catch (err) {
       if (i === attempts - 1) {
         console.warn(`[mp4] chunk ${pathname}@${start} failed: ${err && err.message}`);
       }
+      url = await remintSignedUrl(pathname) || url;
+    } finally {
+      clearTimeout(headerTimer);
+      if (bodyTimer) clearTimeout(bodyTimer);
     }
   }
   return null;
 }
 
+/** True when `offset` has reached the end of the file we know about. */
+function isAtEof(pathname, offset) {
+  const total = mediaTotal.get(pathname);
+  return total ? offset >= total : false;
+}
+
 /**
- * Assemble a byte window for the client from cached chunks, fetching only
- * what is missing.
+ * In-flight chunk fetches, keyed "<pathname>#<index>".
+ *
+ * Without this, a prewarm and the player's first request race for the SAME
+ * chunk. Two 8MB pulls of one cold chunk doubled the time to first byte —
+ * which is exactly the metric we are trying to fix. Deduplicating means N
+ * callers for one chunk cause exactly one upstream request.
  */
-async function assembleWindow(signedUrl, pathname, start, end) {
-  const out = Buffer.alloc(end - start + 1);
+const inflightChunks = new Map();
+
+/** One chunk, from cache or upstream, with concurrent callers sharing it. */
+function getChunk(signedUrl, pathname, off, end) {
+  const idx = Math.floor(off / UPSTREAM_CHUNK);
+  const key = chunkKey(pathname, idx);
+  const want = end - off + 1;
+  const hit = chunkCache.get(key);
+  if (hit && hit.length >= want) return Promise.resolve(hit);
+  if (inflightChunks.has(key)) return inflightChunks.get(key);
+  const p = fetchChunk(signedUrl, pathname, off, end, 3).then((buf) => {
+    inflightChunks.delete(key);
+    if (buf && buf.length) {
+      chunkCache.set(key, buf, buf.length);
+      chunkCacheBytes += buf.length;
+    }
+    return buf;
+  }).catch((err) => {
+    inflightChunks.delete(key);
+    throw err;
+  });
+  inflightChunks.set(key, p);
+  return p;
+}
+
+/**
+ * Learn the real file size with a 1-byte ranged request.
+ *
+ * The browser cannot seek a progressive MP4 without an authoritative total,
+ * and it cannot be sent until we know it. Costs one tiny request, and as a
+ * bonus it touches offset 0 — which is the offset the player wants first.
+ */
+async function ensureTotal(signedUrl, pathname) {
+  const known = mediaTotal.get(pathname);
+  if (known) return known;
+  try {
+    const up = await fetch(signedUrl, {
+      method: 'GET',
+      headers: {
+        Origin: UPSTREAM_MEDIA_SITE,
+        Referer: `${UPSTREAM_MEDIA_SITE}/`,
+        'User-Agent': USER_AGENT,
+        'Accept-Encoding': 'identity',
+        Range: 'bytes=0-0',
+      },
+      redirect: 'manual',
+      signal: AbortSignal.timeout(UPSTREAM_HEADER_TIMEOUT_MS),
+    });
+    const cr = up.headers.get('content-range');
+    try { up.body && (await up.body.cancel()); } catch (_) {}
+    const m = cr && /\/(\d+)\s*$/.exec(cr);
+    if (m) { mediaTotal.set(pathname, Number(m[1])); return Number(m[1]); }
+  } catch (_) { /* total stays unknown; we serve "bytes a-b/*" as a last resort */ }
+  return 0;
+}
+
+/**
+ * Stream a byte window to the client in order, fetching chunks in parallel.
+ *
+ * The previous version assembled the entire window into one Buffer and only
+ * then wrote anything, so a 32MB request made the player wait for all 32MB
+ * before showing a single frame. This starts UPSTREAM_CONCURRENCY fetches
+ * immediately, then writes each chunk to the socket the moment the NEXT
+ * one in sequence is ready. Time-to-first-byte is one chunk, not one window.
+ */
+async function streamWindow(req, res, signedUrl, pathname, start, end) {
+  const total = await ensureTotal(signedUrl, pathname);
+  const want = end - start + 1;
+
   const jobs = [];
   for (let off = start; off <= end; off += UPSTREAM_CHUNK) {
     const chunkEnd = Math.min(off + UPSTREAM_CHUNK - 1, end);
-    const idx = Math.floor(off / UPSTREAM_CHUNK);
-    const key = chunkKey(pathname, idx);
-    const hit = chunkCache.get(key);
-    if (hit && hit.length === chunkEnd - off + 1) {
-      // Buffer.copy(target, targetStart) — data flows chunk -> window.
-      hit.copy(out, off - start);
-    } else {
-      jobs.push({ off, chunkEnd, idx, key });
+    jobs.push({ off, chunkEnd });
+  }
+
+  // Start the first wave straight away.
+  let started = 0;
+  const kick = (n) => { while (started < n && started < jobs.length) { getChunk(signedUrl, pathname, jobs[started].off, jobs[started].chunkEnd).catch(() => {}); started++; } };
+  kick(UPSTREAM_CONCURRENCY);
+
+  let written = 0;
+  let failed = null;
+  for (const job of jobs) {
+    // Keep the pipe full: start the next job while we wait for this one.
+    kick(Math.min(started + UPSTREAM_CONCURRENCY, jobs.length));
+    let buf;
+    try {
+      buf = await getChunk(signedUrl, pathname, job.off, job.chunkEnd);
+    } catch (err) { buf = null; }
+    if (!buf || !buf.length) { failed = `upstream chunk ${job.off} unavailable`; break; }
+    const need = job.chunkEnd - job.off + 1;
+    const slice = buf.length >= need ? buf.subarray(0, need) : buf;
+    written += slice.length;
+    if (res.destroyed) return;
+    if (!res.write(slice)) {
+      try { await once(res, 'drain'); } catch (_) { return; }
     }
   }
-  if (!jobs.length) return out;
-
-  // Small concurrency: enough to keep the window filling, not enough to look
-  // like a burst to an upstream that is already sensitive to request rate.
-  const CONCURRENCY = 3;
-  let cursor = 0;
-  const worker = async () => {
-    while (cursor < jobs.length) {
-      const job = jobs[cursor++];
-      const buf = await fetchChunk(signedUrl, pathname, job.off, job.chunkEnd, 3);
-      if (!buf) throw new Error(`upstream chunk ${job.off} unavailable`);
-      chunkCache.set(job.key, buf, buf.length);
-      chunkCacheBytes += buf.length;
-      buf.copy(out, job.off - start);
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, jobs.length) }, worker));
-  return out;
+  if (failed) throw new Error(failed);
+  res.end();
+  return { total, written, want };
 }
+
+/**
+ * Warm the head of a file in the background so the browser's first range
+ * request finds a hot CDN edge and a hot chunk cache.
+ *
+ * This is the single biggest win in this file. A cold 8MB fetch at this host
+ * takes ~10s; the same 8MB warm takes ~100ms. The player always starts at
+ * byte 0, so warming exactly there converts the worst request of the session
+ * into the cheapest. Fire-and-forget: never blocks /stream's response.
+ */
+function prewarmHead(signedUrl, pathname) {
+  const key = chunkKey(pathname, 0);
+  if (prewarming.has(key) || chunkCache.get(key)) return;
+  prewarming.add(key);
+  (async () => {
+    try {
+      for (let off = 0; off < PREWARM_BYTES; off += UPSTREAM_CHUNK) {
+        const end = off + UPSTREAM_CHUNK - 1;
+        // Go through getChunk, NOT fetchChunk: getChunk shares the in-flight
+        // map. Calling fetchChunk directly made the prewarm and the player's
+        // first request pull the same cold chunk simultaneously, doubling the
+        // load on an edge that was already the bottleneck — the symptom was a
+        // body read that stalled until the timeout fired.
+        const buf = await getChunk(signedUrl, pathname, off, end);
+        if (!buf || buf.length === 0) break;
+      }
+    } catch (_) { /* warming is best-effort; the real request will retry */ }
+    finally { prewarming.delete(key); }
+  })();
+}
+const prewarming = new Set();
 
 async function handleMp4(req, res, url) {
   if (!url) {
@@ -766,6 +925,7 @@ async function handleMp4(req, res, url) {
   const pathname = parsed.pathname;
 
   const r = parseRange(req.headers['range']);
+  const knownTotal = mediaTotal.get(pathname) || 0;
 
   // Work out the window we will actually serve.
   let start = 0;
@@ -783,6 +943,15 @@ async function handleMp4(req, res, url) {
   // total, per request. Larger requests are answered in several round trips
   // by the browser, which is exactly how a <video> already behaves.
   if (end - start + 1 > MAX_SERVE_WINDOW) end = start + MAX_SERVE_WINDOW - 1;
+  // Don't ask past the end of the file. Without this an open-ended range on
+  // the last chunk asks for bytes that do not exist, the upstream returns a
+  // short read, and the old all-or-nothing retry loop burned every attempt.
+  if (knownTotal && end > knownTotal - 1) end = knownTotal - 1;
+  if (end < start) {
+    res.writeHead(416, { 'content-range': `bytes */${knownTotal || '*'}`, 'accept-ranges': 'bytes' });
+    res.end();
+    return;
+  }
 
   let settled = false;
   const onClientGone = () => {
@@ -794,23 +963,41 @@ async function handleMp4(req, res, url) {
   req.on('aborted', onClientGone);
 
   try {
-    const buf = await assembleWindow(url, pathname, start, end);
+    // Resolve the authoritative size before committing to a Content-Range;
+    // it is also what lets us clamp an open-ended range at end-of-file.
+    const total = await ensureTotal(url, pathname);
     if (settled) return;
+    if (total && end > total - 1) end = total - 1;
+    if (end < start) {
+      settled = true;
+      res.writeHead(416, { 'content-range': `bytes */${total || '*'}`, 'accept-ranges': 'bytes' });
+      res.end();
+      return;
+    }
     settled = true;
 
-    const total = mediaTotal.get(pathname) || 0;
-    const cr = `bytes ${start}-${start + buf.length - 1}/${total || '*'}`;
+    // Headers first, bytes immediately after. streamWindow writes each 8MB
+    // chunk the moment it is ready in sequence, so the player gets its first
+    // frame after one chunk instead of after the whole window.
     res.writeHead(206, {
       'content-type': 'video/mp4',
-      'content-length': String(buf.length),
-      'content-range': cr,
+      'content-length': String(end - start + 1),
+      'content-range': `bytes ${start}-${end}/${total || '*'}`,
       'accept-ranges': 'bytes',
       'access-control-allow-origin': '*',
       'x-cache': chunkCache.get(chunkKey(pathname, Math.floor(start / UPSTREAM_CHUNK))) ? 'hit' : 'miss',
+      'x-relay-chunk': String(UPSTREAM_CHUNK),
     });
-    res.end(buf);
+    await streamWindow(req, res, url, pathname, start, end);
   } catch (err) {
-    if (settled) return;
+    if (settled) {
+      // Headers already went out, so we cannot switch to a 502 — just cut the
+      // body short. A truncated response makes the player retry the range,
+      // which is far better than a second full restart.
+      try { res.end(); } catch (_) {}
+      console.warn(`[mp4] stream ${pathname}@${start} ended early: ${err && err.message}`);
+      return;
+    }
     settled = true;
     const msg = err && err.message ? err.message : 'upstream failed';
     res.writeHead(502, { 'content-type': 'application/json' });
