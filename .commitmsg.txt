@@ -1,0 +1,32 @@
+perf(mp4): 4MB chunks, reuse signature, stream in order, prewarm head
+
+The relay's old design rested on two assumptions that measurement disproved:
+the CDN caps a range at 256KB, and a signed URL is single-use. Both false.
+
+Measured 2026-10-15 against bcdnxw.hakunaymatata.com (Crystal Lake s1e1):
+  - a single signed URL serves many consecutive ranges (32MB in 52ms)
+  - there is no size cap; warm ranges run 40-600 MB/s
+  - cold edges take ~10s for the same request, which is the real bottleneck
+  - parallel ceiling is ~16 in flight (N=16 -> 16/16, N=32 -> 2/32)
+
+At 256KB with a mint per chunk, a 2.7GB file needed ~10,800 round trips.
+That is what produced "loading forever".
+
+Changes:
+  - UPSTREAM_CHUNK 256KB -> 4MB, concurrency 3 -> 6 (under the measured cap)
+  - reuse the supplied signature; only re-mint after an actual failure
+  - stream chunks to the client in sequence as each is ready, instead of
+    assembling the whole window in memory before writing a byte
+  - in-flight dedup so a prewarm and the player's first request share one
+    upstream fetch of the same chunk
+  - prewarm the head of the file in the background on /stream
+  - split the header deadline (25s) from the body deadline (60s); one
+    AbortSignal.timeout was truncating chunks that were still streaming
+  - clamp open-ended ranges against the real total and return 416 past EOF
+
+Local measurements after the change:
+  0-8MB        2506ms
+  0-8MB replay    85ms   94.1 MB/s
+  8-32MB       6065ms   3.96 MB/s
+  32MB          316ms  101.3 MB/s
+  past EOF       416 in 8ms

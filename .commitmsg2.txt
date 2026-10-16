@@ -1,0 +1,39 @@
+fix(stream): respect the upstream's granted resolution ceiling (480p)
+
+The CDN enforces a hard Referer allowlist. Measured 2026-10-15 on one signed
+URL:
+
+  Referer https://boxmovies.org/     -> 206
+  Referer https://movibox.xyz/      -> 206
+  Referer https://movbox.xyz/       -> 429
+  no Referer                        -> 429
+  unknown domain                    -> 429
+
+The browser cannot forge Referer (it is set by Chrome's network stack, and
+Referrer-Policy can only remove information, never substitute an origin), so
+every byte must be re-served by this relay. No other CDN host carries the same
+media path: pacdn/macdn/pbcdnw return 404, spa returns a 10KB error page.
+
+That makes VOLUME the whole problem. The upstream hands out:
+
+  360p   154MB
+  480p   251MB
+  1080p 2601MB      <-- 10x the bytes
+
+and states playConfig.maxResolution = 480. We were selecting the highest
+resolution available, so every title pushed 2.6GB through a Cloud Run free-tier
+instance (1 vCPU, 512MB) that has to re-serve each byte. That is the "loading
+forever" the site has been showing.
+
+We now filter streams to the ceiling the upstream actually grants and default
+to 480 when playConfig is absent, and surface maxResolution to the client.
+
+Per title the relay now carries 251MB instead of 2601MB.
+
+Local after the change (480p, 251MB):
+  /stream            1230ms   streams 3 -> 2, 1080p gone
+  head 0-8MB         3551ms
+  head replay          98ms   81.6 MB/s
+  8-32MB             7319ms
+  32MB                287ms  111.5 MB/s
+  past EOF           416 in 11ms

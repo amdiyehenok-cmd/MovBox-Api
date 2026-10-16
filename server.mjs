@@ -421,6 +421,24 @@ async function handleStream(req,res,p){
   let play=await fetchPlay(req, p.detailPath, p.subjectId, p.season||0, p.episode||0);
   let data=(play&&play.data)||{};
   let streams=data.streams||[];
+
+  // Respect the resolution ceiling the upstream grants this account.
+  //
+  // Measured 2026-10-15 on Crystal Lake s1e1:
+  //     playConfig.maxResolution = 480
+  //     360p   154MB
+  //     480p   251MB
+  //     1080p 2601MB      <-- 10x the data for 1/3 the reach
+  //
+  // Every byte over a Referer-enforcing CDN has to be re-served by this relay
+  // on Cloud Run's free tier: 1 vCPU, 512MB. Carrying 2.6GB per title is what
+  // makes the site feel broken; carrying 251MB is comfortably viable. The
+  // upstream is explicitly telling us 480 is our tier, so we stop offering
+  // something it never licensed us.
+  const grantedMax = Number(data.playConfig && data.playConfig.maxResolution) || DEFAULT_MAX_RESOLUTION;
+  const withinTier = streams.filter(s => (Number(s.resolutions) || 0) <= grantedMax);
+  if (withinTier.length) streams = withinTier;
+  if (streams.length > 1) streams.sort((a, b) => (Number(a.resolutions) || 0) - (Number(b.resolutions) || 0));
   // If the upstream's quota is on its last legs and the IP's per-token
   // refresh didn't help, fall through with empty streams. The ad path
   // above (next call from the same IP) will catch it.
@@ -459,6 +477,7 @@ async function handleStream(req,res,p){
       hasResource: streams.length > 0,
       vipLocked: !!data.vipLocked,
       codecPriority: data.codecPriority || [],
+      maxResolution: grantedMax,
       captions,
     },
   };
@@ -610,6 +629,15 @@ const SIGNED_URL_TTL_MS = 30 * 60 * 1000;
 const CHUNK_CACHE_BYTES = 384 * 1048576;
 const UPSTREAM_CONCURRENCY = 6;            // measured ceiling is ~16; stay under
 const PREWARM_BYTES = 16 * 1048576;       // fetch this far past the head on play
+
+/**
+ * Fallback resolution ceiling when the upstream sends no playConfig.
+ *
+ * 480 matches what this account is actually granted (see handleStream), so a
+ * missing/garbled playConfig degrades to the tier we are entitled to rather
+ * than to 1080p that we would have to haul through the relay anyway.
+ */
+const DEFAULT_MAX_RESOLUTION = 480;
 
 /**
  * Upstream pathname -> the identifiers needed to mint a fresh signature.
