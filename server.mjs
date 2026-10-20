@@ -67,6 +67,28 @@ const PORT = Number(process.env.PORT || 4000);
 const HOSTNAME = process.env.HOST || '0.0.0.0';
 const PUBLIC_HOST = process.env.PUBLIC_HOST || '';
 
+/**
+ * Base URL used to build the `/mp4` links inside the `/stream` response.
+ *
+ * Default (empty) = this relay's own public base, so the media bytes flow
+ * through this process. Set MEDIA_BASE to a Cloudflare Worker to move that
+ * hop to the edge: the Worker fetches the CDN itself with the right
+ * Referer, so the bytes never touch this host.
+ *
+ * Why that matters (measured live on 2026-10-20, movbox.xyz):
+ *
+ *   through this host   0.13 - 0.53 MB/s   (3.9 MB moov took 7-12 s)
+ *   direct from CDN     1.8  - 2.7  MB/s   (3.9 MB moov took 1.8-2.4 s)
+ *
+ * The hop was the bottleneck, not the CDN and not the browser. The CDN
+ * hands out a 3.7-3.9 MB `moov` atom at offset 32 (faststart), and the
+ * browser cannot play a single frame until it has all of it, so the
+ * startup delay was ~5x worse than it needed to be.
+ *
+ * Leave this empty to keep the old behaviour (media through this host).
+ */
+const MEDIA_BASE = (process.env.MEDIA_BASE || '').replace(/\/+$/, '');
+
 // ── Upstream transport ─────────────────────────────────────────────────
 // Every media byte comes from one CDN host, fetched with undici's `fetch`.
 //
@@ -506,6 +528,9 @@ async function handleStream(req,res,p){
   // Build the base URL for proxied /mp4 and /subtitle entries. Must come
   // BEFORE the cleanCaption call below since captions use it too.
   const base = baseUrl(req);
+  // Media links can point at a different host (the edge media hop) than
+  // the API/caption links. Captions stay here: they are a few KB.
+  const mediaBase = MEDIA_BASE || base;
   const k=keyOf(p);let cached=cacheGet(k);
   if(cached){res.writeHead(200,{'content-type':'application/json','x-cache':'hit'});res.end(JSON.stringify(cached));return;}
   let play=await fetchPlay(req, p.detailPath, p.subjectId, p.season||0, p.episode||0);
@@ -564,7 +589,7 @@ async function handleStream(req,res,p){
     // Warm the rung the client is about to AUTO-PLAY, which is index 0
     // (the smallest). Warming the biggest one instead was the old
     // behaviour and it warmed a file nobody was about to open.
-    if (i === 0) { try { prewarmEdge(s.url); } catch (_) {} }
+    if (PREWARM_ENABLED && i === 0) { try { prewarmEdge(s.url); } catch (_) {} }
     // Normalise the fields the clients read, so the app never has to
     // guess which of resolutions/resolution/size carries what.
     const res = Number(s.resolutions) || Number(s.resolution) || 0;
@@ -575,7 +600,7 @@ async function handleStream(req,res,p){
       quality: s.quality || (res > 0 ? `${res}p` : 'Auto'),
       size: size,
       sizeBytes: size,
-      url:`${base}/mp4?url=${encodeURIComponent(s.url)}`};
+      url:`${mediaBase}/mp4?url=${encodeURIComponent(s.url)}`};
   });
   const out={
     ok: streams.length > 0,
@@ -723,7 +748,13 @@ async function handleReward(req, res) {
 //
 // So the relay does ONE thing: add the Referer the browser cannot set.
 const SIGNED_URL_TTL_MS = 30 * 60 * 1000;   // how long we remember how to re-mint a path
-const PREWARM_BYTES = 2 * 1048576;         // head range we ask for to warm the edge
+// Head range we ask for to warm the edge. 2 MB was wasteful: on a host
+// whose upstream throughput is ~0.13 MB/s that is ~15 s of background
+// egress, and it competes with the stream the user is actually waiting
+// for. 256 KB is enough to get the object into the edge cache.
+const PREWARM_BYTES = Number(process.env.PREWARM_BYTES || 262144);
+// Set PREWARM=0 to switch the warm-up off entirely.
+const PREWARM_ENABLED = process.env.PREWARM !== '0';
 
 /**
  * Optional resolution ceiling.
@@ -1117,6 +1148,22 @@ const server=http.createServer(async(req,res)=>{
     if(u.pathname==='/health'){const m=process.memoryUsage();const up=await probeUpstream(false);res.writeHead(up.reachable?200:503,{'content-type':'application/json'});res.end(JSON.stringify({ok:true,ram_mb:Math.round(m.rss/1024/1024*10)/10,cache_size:cache.size,cache_mb:Math.round(cache.totalBytes/1048576*10)/10,token_pool_size:tokenStore.size,ip_plays_tracked:ipPlays.size,free_plays_per_day:FREE_PLAYS_PER_DAY,max_resolution:MAX_RESOLUTION,upstream:{reachable:up.reachable,status:up.status,ms:up.ms,err:up.err},uptime_s:Math.round(process.uptime())}));return;}
     if(u.pathname==='/stream'){const p={detailPath:u.searchParams.get('detailPath'),subjectId:u.searchParams.get('subjectId'),season:u.searchParams.get('season')||'0',episode:u.searchParams.get('episode')||'0'};await handleStream(req,res,p);return;}
     if(u.pathname==='/mp4'){await handleMp4(req, res, u.searchParams.get('url'));return;}
+    // Re-mint a signed media URL for a known path.
+    //
+    // The edge media hop (Cloudflare Worker) fetches the CDN itself, so
+    // when a signature expires it has no way to mint a new one - it cannot
+    // hold the upstream Bearer token. This endpoint is how it asks.
+    // Only paths we minted ourselves are accepted; the lookup is by
+    // pathname, which is stable across mints.
+    if(u.pathname==='/remint'){
+      const pth=u.searchParams.get('path');
+      if(!pth||!pth.startsWith('/')||pth.includes('..')){res.writeHead(400,{'content-type':'application/json'});res.end(JSON.stringify({ok:false,error:'bad path'}));return;}
+      const fresh=await remintSignedUrl(pth);
+      if(!fresh){res.writeHead(404,{'content-type':'application/json'});res.end(JSON.stringify({ok:false,error:'cannot re-mint'}));return;}
+      res.writeHead(200,{'content-type':'application/json','access-control-allow-origin':'*','cache-control':'no-store'});
+      res.end(JSON.stringify({ok:true,url:fresh}));
+      return;
+    }
     if(u.pathname==='/search'){await handleSearch(req,res);return;}
     if(u.pathname==='/subtitle'){const url=u.searchParams.get('url');if(!url){res.writeHead(400,{'content-type':'application/json'});res.end(JSON.stringify({ok:false,error:'url required'}));return;}const fmt=(u.searchParams.get('format')||'vtt').toLowerCase();await handleSubtitle(req,res,url,fmt!=='srt');return;}
     if(u.pathname==='/reward'){await handleReward(req,res);return;}
