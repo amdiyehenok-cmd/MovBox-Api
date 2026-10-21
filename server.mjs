@@ -23,7 +23,6 @@
 
 import http from 'node:http';
 import { URL } from 'node:url';
-import { Readable } from 'node:stream';
 import { createHash } from 'node:crypto';
 
 const H5 = 'https://h5-api.aoneroom.com/wefeed-h5api-bff';
@@ -978,24 +977,77 @@ async function handleMp4(req, res, url) {
   const lm = up.headers.get('last-modified');
   if (lm) headers['last-modified'] = lm;
 
+  if (!up.body) { res.writeHead(up.status, headers); res.end(); return; }
+
+  // ── Stream without Node's stream machinery ───────────────────────────
+  // The single change that most reliably moves a proxied body fast.
+  //
+  // `Readable.fromWeb(up.body).pipe(res)` routes a multi-hundred-MB file
+  // through Node's stream layer, whose 16 KB high-water mark quantises it
+  // into thousands of tiny socket writes. Reading the web stream by hand
+  // and writing straight to the socket lets each full buffer drain in one
+  // write, and lets us ask the platform not to sit on the response.
+  //
+  // Deliberately NOT buffering the front of the file here. Every one of
+  // these is a faststart MP4 — `ftyp` then a 4.2-4.4 MB `moov` atom at
+  // offset 32 — and a browser will not paint a frame until it holds that
+  // whole block, so playback startup is gated purely on how fast bytes
+  // 0..N arrive. Serving a cached prefix looks tempting, but answering a
+  // partial Range from it breaks `Content-Range` and therefore breaks
+  // seeking: a 64 KB request would come back as the whole cached block
+  // with no range header, and the player would mis-size the file.
   res.writeHead(up.status, headers);
+  try { res.flushHeaders(); } catch (_) {}
 
-  if (!up.body) { res.end(); return; }
-
-  // Stream the body straight through. No buffering, no chunk cache, no
-  // window, no extra size probe. The relay's memory use is now flat
-  // regardless of how large the file is.
-  const body = Readable.fromWeb(up.body);
+  // ── Manual pump ──────────────────────────────────────────────────────
+  // `res.write` returning false means the socket is full; we then await
+  // 'drain'. Skipping that is what turns a proxy into a memory leak.
+  const reader = up.body.getReader();
   let closed = false;
-  const cleanup = () => {
+  const stop = () => {
     if (closed) return;
     closed = true;
-    try { body.destroy(); } catch (_) {}
+    try { reader.cancel(); } catch (_) {}
   };
-  res.on('close', cleanup);
-  req.on('aborted', cleanup);
-  body.on('error', () => { try { res.end(); } catch (_) {} });
-  body.pipe(res);
+  res.on('close', stop);
+  req.on('aborted', stop);
+
+  // One shared drain promise for the whole response. Registering a fresh
+  // `once(res,'drain')` per chunk would pile up listeners for the life of
+  // the stream and trip Node's max-listeners warning on long files.
+  let drainWait = null;
+  const waitDrain = () => {
+    if (!drainWait) {
+      drainWait = new Promise(resolve => {
+        const done = () => {
+          res.off('drain', done);
+          res.off('close', done);
+          drainWait = null;
+          resolve();
+        };
+        res.on('drain', done);
+        res.on('close', done);
+      });
+    }
+    return drainWait;
+  };
+
+  try {
+    for (;;) {
+      if (closed) break;
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || !value.length) continue;
+      const buf = Buffer.isBuffer(value) ? value : Buffer.from(value);
+      if (!res.write(buf)) {
+        await waitDrain();
+        if (closed) break;
+      }
+    }
+    res.end();
+  } catch (_) {
+    try { res.end(); } catch (_) {}
+  }
 }
 
 /**
